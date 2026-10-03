@@ -13,17 +13,18 @@ npm run dev
 
 Open http://localhost:3000.
 
-## Env (all optional — app works without keys)
+## Env (all optional except OCR — app degrades gracefully without keys)
 
 Copy `.env.example` to `.env.local`:
 
+- `OPENROUTER_API_KEY` — **required for photo reading**. Models via `OPENROUTER_OCR_MODEL` (default `google/gemini-2.5-flash`).
 - `NEXT_PUBLIC_GA4_ID` — GA4 measurement ID. Empty = analytics disabled.
 - `OPENAI_API_KEY` (+ `OPENAI_MODEL`, default `gpt-4o-mini`) — upgrades wine enrichment from built-in heuristics to live retail + quality data.
 - `TYPESAFE_API_KEY` — upgrades decisioning from the deterministic fallback to real Jev System One judgments. See `lib/jev.ts` (`jevRequestBody`).
 
 ## How it works
 
-1. Photo is read on-device with Tesseract.js (`lib/ocr-parse.ts`), parsed into `{rawName, vintage, listPrice, ocrConfidence}`.
+1. Photo is compressed on-device (max 1600px JPEG), then read by a vision model via OpenRouter (`POST /api/ocr` -> structured `{name, vintage, listPrice, confidence}` JSON).
 2. `POST /api/rank` enriches (heuristic now, batched LLM when key set, cached) and scores pairing/value/quality with confidence bands High/Medium/Low.
 3. UI shows Best Match / Best Value / Wildcard + full ranked list. Low-OCR or unconfirmed entries are capped and flagged, never hidden.
 

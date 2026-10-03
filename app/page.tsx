@@ -1,7 +1,6 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { parseOcrText } from "@/lib/ocr-parse";
 import type { RankedWine, RankResponse, WineCandidate } from "@/lib/types";
 import { track } from "@/lib/analytics";
 import { getEntitlement, recordScan } from "@/lib/entitlements";
@@ -24,25 +23,54 @@ export default function Home() {
   async function onFile(f: File | undefined) {
     if (!f) return;
     setError(null);
-    const url = URL.createObjectURL(f);
-    setImageUrl(url);
     setStep("reading");
     track("scan_started", { has_dish: Boolean(dish.trim()) });
     try {
-      const { createWorker } = await import("tesseract.js");
-      const worker = await createWorker("eng");
-      const { data } = await worker.recognize(f);
-      await worker.terminate();
-      const avg = typeof data.confidence === "number" ? data.confidence / 100 : 0.7;
-      const parsed = parseOcrText(data.text ?? "", avg);
+      const compressed = await compressImage(f);
+      setImageUrl(compressed);
+      const res = await fetch("/api/ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: compressed }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "List reading failed");
+      const parsed = (data.wines ?? []) as WineCandidate[];
       setWines(parsed);
-      track("ocr_completed", { wine_count: parsed.length, ocr_confidence_avg: avg });
+      track("ocr_completed", { wine_count: parsed.length, model: data.model ?? "openrouter" });
       setStep("review");
       if (!parsed.length) setError("Couldn't read any wines - try a straighter, well-lit photo, or add them manually below.");
-    } catch {
-      setError("Photo reading failed on-device. Add wines manually below, then Analyse.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Photo reading failed. Add wines manually below, then Find my pairing.");
       setStep("review");
     }
+  }
+
+  function compressImage(file: File, maxDim = 1600, quality = 0.82): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const w = Math.round(img.width * scale);
+          const h = Math.round(img.height * scale);
+          const canvas = document.createElement("canvas");
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) throw new Error("canvas");
+          ctx.drawImage(img, 0, 0, w, h);
+          URL.revokeObjectURL(url);
+          resolve(canvas.toDataURL("image/jpeg", quality));
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      img.onerror = reject;
+      img.src = url;
+    });
   }
 
   function updateWine(id: string, patch: Partial<WineCandidate>) {
