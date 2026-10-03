@@ -1,3 +1,5 @@
+import type { CurrencyCode } from "./currency";
+
 export type WineCandidate = {
   id: string;
   rawName: string;
@@ -18,6 +20,14 @@ export type EnrichedWine = WineCandidate & {
   grounded: boolean; // true if from lookup/LLM with confidence, false if heuristic guess
 };
 
+// Crowd price index: what this bottle typically costs on restaurant lists (GBP-normalised).
+export type MarketInfo = {
+  n: number; // distinct menus seen
+  medianGBP: number;
+  minGBP: number;
+  maxGBP: number;
+};
+
 export type RankedWine = EnrichedWine & {
   pairingFit: number; // 0-2 (Jev Score equivalent)
   valueScore: number; // 0-1 (Jev Noul equivalent)
@@ -28,6 +38,7 @@ export type RankedWine = EnrichedWine & {
   why: string;
   role?: "Best Match" | "Best Value" | "Wildcard";
   flags: string[];
+  market?: MarketInfo & { deltaPct: number }; // deltaPct: this list's price vs the median (+ = dearer)
 };
 
 export type RankResponse = {
@@ -37,5 +48,7 @@ export type RankResponse = {
     enrichment: "llm" | "heuristic";
     decisioning: "jev" | "heuristic";
     warnings: string[];
+    currency: CurrencyCode;
+    marketMatches: number; // wines with enough price-index data to compare
   };
 };

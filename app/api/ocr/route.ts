@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { WineCandidate } from "@/lib/types";
+import { parseCurrency } from "@/lib/currency";
+import { FREE_SCANS_LIFETIME } from "@/lib/limits";
+import { peek } from "@/lib/store";
+import { getDevice, rateLimit, setDeviceCookie } from "@/lib/guard";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -20,6 +24,18 @@ function fail(error: string, status: number) {
 }
 
 export async function POST(req: NextRequest) {
+  const device = getDevice(req);
+  const res = await handle(req, device.id);
+  if (device.isNew) setDeviceCookie(res, device.id);
+  return res;
+}
+
+async function handle(req: NextRequest, deviceId: string): Promise<NextResponse> {
+  const limited = (await rateLimit(req, "ocr", 12, 600)) ?? (await rateLimit(req, "ocr-day", 150, 86_400));
+  if (limited) return limited;
+  // Don't spend OCR credit on devices that have used their free scans.
+  if ((await peek(`scans:${deviceId}`)) >= FREE_SCANS_LIFETIME) return fail("Free scan limit reached on this device. Paid plans coming soon.", 402);
+
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     return fail("Photo reading isn't configured yet. Add OPENROUTER_API_KEY in Vercel, or add wines manually below.", 501);
@@ -58,7 +74,7 @@ export async function POST(req: NextRequest) {
           {
             role: "system",
             content:
-              "You are a precise wine-list OCR API. Read the wine list photo and return ONLY JSON: {wines:[{name,vintage,listPrice,confidence}]}. Rules: name = wine name + producer as printed (no dish text, no headers); vintage = 4-digit year or null; listPrice = number only in the menu currency or null; confidence = 0-1 per row. Include every wine, even if price missing. Never invent wines. Max 40 rows.",
+              "You are a precise wine-list OCR API. Read the wine list photo and return ONLY JSON: {currency,wines:[{name,vintage,listPrice,confidence}]}. currency = ISO code of the menu prices (GBP, EUR, USD, AUD, CAD or CHF), inferred from symbols; default GBP. Rules: name = wine name + producer as printed (no dish text, no headers); vintage = 4-digit year or null; listPrice = number only in the menu currency or null; confidence = 0-1 per row. Include every wine, even if price missing. Never invent wines. Max 40 rows.",
           },
           {
             role: "user",
@@ -82,7 +98,7 @@ export async function POST(req: NextRequest) {
 
     const data = await res.json();
     const content: string = data?.choices?.[0]?.message?.content ?? "";
-    let parsed: { wines?: OcrWine[] };
+    let parsed: { wines?: OcrWine[]; currency?: unknown };
     try {
       parsed = JSON.parse(content);
     } catch {
@@ -111,7 +127,7 @@ export async function POST(req: NextRequest) {
       ];
     });
 
-    return NextResponse.json({ wines, model });
+    return NextResponse.json({ wines, currency: parseCurrency(parsed.currency), model });
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
     console.error("OCR route error", aborted ? "timeout" : e);

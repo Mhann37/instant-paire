@@ -1,5 +1,6 @@
 import type { EnrichedWine } from "./types";
 import { dishProfile } from "./enrich";
+import { CURRENCIES, toGBP, type CurrencyCode } from "./currency";
 
 // Decisioning has two paths with identical output shape:
 // 1. Real Jev via OpenRouter Decisions API (typesafe/jev-1.13, same OPENROUTER_API_KEY)
@@ -18,7 +19,7 @@ export type Judgment = {
   live: boolean;
 };
 
-export function judgeWine(w: EnrichedWine, dish: string): Judgment {
+export function judgeWine(w: EnrichedWine, dish: string, currency: CurrencyCode = "GBP"): Judgment {
   const flags: string[] = [];
   const prof = dishProfile(dish);
 
@@ -32,7 +33,7 @@ export function judgeWine(w: EnrichedWine, dish: string): Judgment {
 
   let valueScore = 0.55;
   if (w.listPrice && w.typicalRetailGBP) {
-    const mult = w.listPrice / w.typicalRetailGBP;
+    const mult = toGBP(w.listPrice, currency) / w.typicalRetailGBP;
     valueScore = mult <= 2.2 ? 0.95 : mult <= 3 ? 0.75 : mult <= 4 ? 0.5 : 0.3;
     if (mult > 4) flags.push("Steep markup vs typical retail");
   } else if (!w.listPrice) {
@@ -58,17 +59,32 @@ export function judgeWine(w: EnrichedWine, dish: string): Judgment {
 
 type JevAnswers = Record<string, { type: string; noul?: number; score?: number; confidence?: number }>;
 
+const JEV_CHUNK = 20; // questions per request; larger lists are scored in parallel chunks
+
+type JevScore = { pairingFit: number; valueScore: number; confidence: number };
+
 export async function judgeWithJev(
   wines: EnrichedWine[],
   dish: string,
   apiKey: string,
-  model = JEV_MODEL
-): Promise<Map<string, { pairingFit: number; valueScore: number; confidence: number }>> {
-  // Cap questions to keep the request fast: top 20 by list presence.
-  const subset = wines.slice(0, 20);
+  model = JEV_MODEL,
+  currency: CurrencyCode = "GBP",
+): Promise<Map<string, JevScore>> {
+  const chunks: EnrichedWine[][] = [];
+  for (let i = 0; i < wines.length; i += JEV_CHUNK) chunks.push(wines.slice(i, i + JEV_CHUNK));
+  // If any chunk fails the whole call throws, so a list is never half Jev-scored / half heuristic.
+  const parts = await Promise.all(chunks.map((c) => judgeChunk(c, dish, apiKey, model, currency)));
+  const out = new Map<string, JevScore>();
+  for (const part of parts) for (const [id, v] of part) out.set(id, v);
+  if (out.size < Math.ceil(wines.length * 0.8)) throw new Error("Jev returned too few usable answers");
+  return out;
+}
+
+async function judgeChunk(subset: EnrichedWine[], dish: string, apiKey: string, model: string, currency: CurrencyCode): Promise<Map<string, JevScore>> {
+  const sym = CURRENCIES[currency].symbol;
   const questions: Record<string, unknown> = {};
   for (const w of subset) {
-    const label = `${w.rawName}${w.vintage ? ` ${w.vintage}` : ""}${w.listPrice ? ` - £${w.listPrice}` : ""} (${w.style})`;
+    const label = `${w.rawName}${w.vintage ? ` ${w.vintage}` : ""}${w.listPrice ? ` - ${sym}${w.listPrice}` : ""} (${w.style})`;
     questions[`pair_${w.id}`] = {
       type: "score",
       instructions: `How well does this wine suit the dish "${dish}"? Wine: ${label}.`,
@@ -76,7 +92,7 @@ export async function judgeWithJev(
     };
     questions[`value_${w.id}`] = {
       type: "noul",
-      instructions: `Is this wine fair value at its list price? Wine: ${label}${w.typicalRetailGBP ? `, typical retail ~£${w.typicalRetailGBP}` : ""}. Restaurant fair is roughly 2.5-3x retail.`,
+      instructions: `Is this wine fair value at its list price (${currency})? Wine: ${label}${w.typicalRetailGBP ? `, typical UK retail ~£${w.typicalRetailGBP}` : ""}. Restaurant fair is roughly 2.5-3x retail.`,
       criteria: { true: "Fair or good value at this list price", false: "Overpriced for what it is" },
     };
   }
@@ -94,6 +110,7 @@ export async function judgeWithJev(
       model,
       state: {
         dish,
+        currency,
         wines: subset.map((w) => ({
           id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice,
           style: w.style, category: w.category, body: w.body, acidity: w.acidity, tannin: w.tannin,
@@ -106,7 +123,7 @@ export async function judgeWithJev(
   if (!res.ok) throw new Error(`Jev ${res.status}`);
   const data = await res.json();
   const answers = (data.answers ?? {}) as JevAnswers;
-  const out = new Map<string, { pairingFit: number; valueScore: number; confidence: number }>();
+  const out = new Map<string, JevScore>();
   for (const w of subset) {
     const p = answers[`pair_${w.id}`];
     const v = answers[`value_${w.id}`];
@@ -118,7 +135,6 @@ export async function judgeWithJev(
     ));
     out.set(w.id, { pairingFit, valueScore, confidence });
   }
-  if (!out.size) throw new Error("Jev returned no usable answers");
   return out;
 }
 
