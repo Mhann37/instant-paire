@@ -89,6 +89,7 @@ export async function judgeWithJev(
       "HTTP-Referer": "https://instant-paire.vercel.app",
       "X-Title": "Instant Paire",
     },
+    signal: AbortSignal.timeout(25_000),
     body: JSON.stringify({
       model,
       state: {

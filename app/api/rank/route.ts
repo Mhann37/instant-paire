@@ -23,7 +23,21 @@ export async function POST(req: NextRequest) {
   }
   try {
     const dish: string = String(body.dish ?? "").slice(0, 200);
-    const wines: WineCandidate[] = Array.isArray(body.wines) ? body.wines.slice(0, 40) : [];
+    const wines: WineCandidate[] = (Array.isArray(body.wines) ? body.wines.slice(0, 40) : []).flatMap((raw, i) => {
+      const w = (raw ?? {}) as Record<string, unknown>;
+      const rawName = typeof w.rawName === "string" ? w.rawName.trim().slice(0, 120) : "";
+      if (!rawName) return [];
+      const price = Number(w.listPrice);
+      const ocr = Number(w.ocrConfidence);
+      return [{
+        id: typeof w.id === "string" && w.id ? w.id.slice(0, 40) : `w${i + 1}`,
+        rawName,
+        vintage: typeof w.vintage === "string" && /^(19|20)\d{2}$/.test(w.vintage) ? w.vintage : undefined,
+        listPrice: Number.isFinite(price) && price > 0 ? price : undefined,
+        ocrConfidence: Number.isFinite(ocr) ? Math.max(0, Math.min(1, ocr)) : 0.7,
+        needsReview: w.needsReview === true,
+      }];
+    });
     if (!dish.trim()) return fail("Tell us what you're eating first.", 400);
     if (!wines.length) return fail("No wines to rank - rescan the list.", 400);
 
@@ -102,6 +116,7 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
     ? (process.env.OPENROUTER_MODEL ?? process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha")
     : (process.env.OPENAI_MODEL ?? "gpt-4o-mini");
   const uncached = wines.filter((w) => !cache.has(cacheKey(w)));
+  const byId = new Map(wines.map((w) => [w.id, w]));
   if (uncached.length) {
     const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(uncached.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
     const endpoint = useOpenRouter ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
@@ -113,6 +128,7 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
     const res = await fetch(endpoint, {
       method: "POST",
       headers,
+      signal: AbortSignal.timeout(25_000),
       body: JSON.stringify({
         model,
         temperature: 0.2,
@@ -129,7 +145,9 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
     const arr: LlmWineItem[] = parsed.wines ?? [];
     for (const item of arr) {
       if (!item?.id) continue;
-      cache.set(cacheKey({ rawName: "", id: item.id } as EnrichedWine, item.id), {
+      const src = byId.get(item.id);
+      if (!src) continue;
+      cache.set(cacheKey(src), {
         style: String(item.style ?? "wine").slice(0, 60),
         category: validCat(item.category),
         body: num(item.body, 1), acidity: num(item.acidity, 1), tannin: num(item.tannin, 0),
@@ -142,8 +160,9 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
   return wines.map((w) => ({ ...w, ...(cache.get(cacheKey(w)) ?? {}) }));
 }
 
-function cacheKey(w: EnrichedWine, overrideId?: string) {
-  return `wine:${(overrideId ?? w.id)}`;
+// Ids ("w1", "w2"...) are per-scan, so the cache must key on the wine itself.
+function cacheKey(w: EnrichedWine) {
+  return `wine:${w.rawName.toLowerCase().replace(/\s+/g, " ").trim()}|${w.vintage ?? ""}`;
 }
 
 type LlmWineItem = {

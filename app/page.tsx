@@ -46,6 +46,11 @@ function friendlyHttpError(status: number, body: string): string {
   return `Request failed (${status}).${hint}`;
 }
 
+function parsePrice(raw: string): number | undefined {
+  const n = parseFloat(raw.replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 function urlTail(): string {
   return typeof window !== "undefined" ? window.location.pathname : "app";
 }
@@ -59,9 +64,17 @@ export default function Home() {
   const [step, setStep] = useState<Step>("input");
   const [error, setError] = useState<string | null>(null);
   const [scansLeft, setScansLeft] = useState<number | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const libraryRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
 
   const canAnalyse = useMemo(() => dish.trim().length > 1 && (wines.length > 0 || imageUrl), [dish, wines, imageUrl]);
+
+  function onFileInput(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    // Reset so picking the same file again (e.g. after an error) still fires onChange.
+    e.target.value = "";
+    void onFile(f);
+  }
 
   async function onFile(f: File | undefined) {
     if (!f) return;
@@ -105,7 +118,10 @@ export default function Home() {
           reject(err);
         }
       };
-      img.onerror = reject;
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("Couldn't open that image. Try a JPG or PNG, or take a new photo."));
+      };
       img.src = url;
     });
   }
@@ -189,7 +205,7 @@ export default function Home() {
           <div className="mt-5">
             <p className="text-sm font-medium">Wine list photo</p>
             <div
-              onClick={() => fileRef.current?.click()}
+              onClick={() => libraryRef.current?.click()}
               className="mt-2 flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 px-4 py-8 text-center transition hover:border-neutral-900"
             >
               {imageUrl ? (
@@ -203,19 +219,40 @@ export default function Home() {
                 </>
               )}
             </div>
+            {/* Two inputs on purpose: `capture` forces the camera on mobile and hides the photo library. */}
             <input
-              ref={fileRef}
+              ref={libraryRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => onFileInput(e)}
+            />
+            <input
+              ref={cameraRef}
               type="file"
               accept="image/*"
               capture="environment"
               className="hidden"
-              onChange={(e) => onFile(e.target.files?.[0])}
+              onChange={(e) => onFileInput(e)}
             />
-            {imageUrl && (
-              <button onClick={() => fileRef.current?.click()} className="mt-2 text-xs font-medium underline underline-offset-4">
-                Retake photo
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => cameraRef.current?.click()}
+                disabled={step === "reading"}
+                className="rounded-2xl border border-neutral-200 bg-white py-3 text-sm font-medium transition hover:border-neutral-900 disabled:opacity-40"
+              >
+                Take photo
               </button>
-            )}
+              <button
+                type="button"
+                onClick={() => libraryRef.current?.click()}
+                disabled={step === "reading"}
+                className="rounded-2xl border border-neutral-200 bg-white py-3 text-sm font-medium transition hover:border-neutral-900 disabled:opacity-40"
+              >
+                {imageUrl ? "Choose another" : "Choose from library"}
+              </button>
+            </div>
           </div>
 
           {step === "reading" && (
@@ -223,7 +260,7 @@ export default function Home() {
               <div className="h-1.5 overflow-hidden rounded-full bg-neutral-100">
                 <div className="h-full w-1/3 animate-pulse rounded-full bg-neutral-900" />
               </div>
-              <p className="mt-2 text-xs text-neutral-500">Reading list on your device…</p>
+              <p className="mt-2 text-xs text-neutral-500">Reading your wine list…</p>
             </div>
           )}
 
@@ -245,8 +282,8 @@ export default function Home() {
                       className="w-full bg-transparent text-sm outline-none"
                     />
                     <input
-                      value={w.listPrice ?? ""}
-                      onChange={(e) => updateWine(w.id, { listPrice: e.target.value ? Number(e.target.value) : undefined })}
+                      defaultValue={w.listPrice ?? ""}
+                      onChange={(e) => updateWine(w.id, { listPrice: parsePrice(e.target.value) })}
                       placeholder="£"
                       inputMode="decimal"
                       aria-label="List price"
