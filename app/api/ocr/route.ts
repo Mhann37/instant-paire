@@ -1,23 +1,44 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { WineCandidate } from "@/lib/types";
-import { parseCurrency } from "@/lib/currency";
+import { parseCurrency, type CurrencyCode } from "@/lib/currency";
 import { FREE_SCANS_LIFETIME } from "@/lib/limits";
-import { peek } from "@/lib/store";
 import { getDevice, rateLimit, setDeviceCookie } from "@/lib/guard";
+import { peek } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const DEFAULT_MODEL = process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha";
+// Speed notes: reading a menu is perception, not reasoning. We use a small fast vision model
+// with reasoning OFF, a hard token cap, and a compact line format (name|vintage|price) instead of
+// verbose JSON so there are far fewer output tokens to generate. If the primary model errors or
+// finds nothing, one retry goes to a stronger fallback model.
+const PRIMARY_MODEL = process.env.OCR_MODEL ?? "inclusionai/ling-3.0-flash-vl";
+const FALLBACK_MODEL = process.env.OCR_FALLBACK_MODEL ?? "google/gemini-3.8-flash";
+// Overridable so the route can be exercised against a local stub.
+const OR_BASE = process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1";
+const PRIMARY_TIMEOUT_MS = 22_000;
+const FALLBACK_TIMEOUT_MS = 28_000;
 // Vercel serverless request body limit is ~4.5MB; base64 inflates by ~1.33x.
 const MAX_CHARS = 3_400_000;
+const MAX_WINES = 40;
 
-type OcrWine = {
-  name?: unknown;
-  vintage?: unknown;
-  listPrice?: unknown;
-  confidence?: unknown;
-};
+const SYSTEM_PROMPT = [
+  "You are a precise wine-list OCR engine. Reply with plain text only - no commentary, no markdown.",
+  "Line 1: CURRENCY=<ISO code of the menu prices: GBP, EUR, USD, AUD, CAD or CHF; GBP if unsure>.",
+  `Then one wine per line, exactly: name|vintage|price (max ${MAX_WINES} lines).`,
+  "name = wine name + producer exactly as printed (no tasting notes, headers or food).",
+  "vintage = 4-digit year, or empty (NV/none).",
+  "price = the BOTTLE price as a plain number, or empty. If a glass price and a bottle price are both shown, use the bottle price.",
+  "Include every wine even if the price is missing. Never invent wines.",
+].join("\n");
+
+class OcrError extends Error {
+  constructor(message: string, readonly status: number, readonly retryable = true) {
+    super(message);
+  }
+}
+
+type Parsed = { wines: WineCandidate[]; currency: CurrencyCode };
 
 function fail(error: string, status: number) {
   return NextResponse.json({ error, wines: [] }, { status });
@@ -52,12 +73,31 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
   if (!image.startsWith("data:image/")) return fail("Send the photo as an image data URL.", 400);
   if (image.length > MAX_CHARS) return fail("Photo too large - take a closer shot of just the wine list.", 413);
 
-  const model = DEFAULT_MODEL;
+  const started = Date.now();
+  let lastErr: OcrError | null = null;
+  const attempts: [string, number][] = [[PRIMARY_MODEL, PRIMARY_TIMEOUT_MS]];
+  if (FALLBACK_MODEL && FALLBACK_MODEL !== PRIMARY_MODEL) attempts.push([FALLBACK_MODEL, FALLBACK_TIMEOUT_MS]);
 
+  for (const [model, timeoutMs] of attempts) {
+    try {
+      const parsed = await readMenu(model, image, apiKey, timeoutMs);
+      if (!parsed.wines.length) throw new OcrError("No wines found in the photo.", 422);
+      console.info("ocr ok", JSON.stringify({ model, wines: parsed.wines.length, ms: Date.now() - started, fellBack: model !== PRIMARY_MODEL }));
+      return NextResponse.json({ wines: parsed.wines, currency: parsed.currency, model });
+    } catch (e) {
+      lastErr = e instanceof OcrError ? e : new OcrError("List reading failed. Try again or add wines manually.", 500);
+      console.error("ocr attempt failed", JSON.stringify({ model, ms: Date.now() - started, status: lastErr.status, msg: lastErr.message }));
+      if (!lastErr.retryable) break;
+    }
+  }
+  const err = lastErr ?? new OcrError("List reading failed. Try again or add wines manually.", 500);
+  return fail(err.message, err.status);
+}
+
+async function readMenu(model: string, image: string, apiKey: string, timeoutMs: number): Promise<Parsed> {
+  let res: Response;
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 55_000);
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    res = await fetch(`${OR_BASE}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -65,72 +105,113 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
         "HTTP-Referer": "https://instant-paire.vercel.app",
         "X-Title": "Instant Paire",
       },
-      signal: controller.signal,
+      signal: AbortSignal.timeout(timeoutMs),
       body: JSON.stringify({
         model,
         temperature: 0,
-        response_format: { type: "json_object" },
+        max_tokens: 2400,
+        reasoning: { enabled: false },
+        include_reasoning: false,
+        provider: { sort: "latency" },
         messages: [
-          {
-            role: "system",
-            content:
-              "You are a precise wine-list OCR API. Read the wine list photo and return ONLY JSON: {currency,wines:[{name,vintage,listPrice,confidence}]}. currency = ISO code of the menu prices (GBP, EUR, USD, AUD, CAD or CHF), inferred from symbols; default GBP. Rules: name = wine name + producer as printed (no dish text, no headers); vintage = 4-digit year or null; listPrice = number only in the menu currency or null; confidence = 0-1 per row. Include every wine, even if price missing. Never invent wines. Max 40 rows.",
-          },
+          { role: "system", content: SYSTEM_PROMPT },
           {
             role: "user",
             content: [
-              { type: "text", text: "Extract all wines from this wine list photo as JSON." },
+              { type: "text", text: "Transcribe every wine on this list." },
               { type: "image_url", image_url: { url: image } },
             ],
           },
         ],
       }),
-    }).finally(() => clearTimeout(timeout));
-
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.error("OpenRouter OCR failed", res.status, t.slice(0, 800));
-      if (res.status === 401 || res.status === 403) return fail("OpenRouter key was rejected. Check OPENROUTER_API_KEY in Vercel.", 502);
-      if (res.status === 404 || /no endpoints|model not found/i.test(t)) return fail(`Model "${model}" is unavailable on OpenRouter. Set OPENROUTER_OCR_MODEL to a vision model.`, 502);
-      if (res.status === 429) return fail("Rate limited by the model provider - try again in a moment.", 429);
-      return fail("List reading failed upstream. Try again, or add wines manually.", 502);
-    }
-
-    const data = await res.json();
-    const content: string = data?.choices?.[0]?.message?.content ?? "";
-    let parsed: { wines?: OcrWine[]; currency?: unknown };
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      console.error("OCR model returned non-JSON", content.slice(0, 400));
-      return fail("Model returned an unexpected format. Try again or add wines manually.", 502);
-    }
-
-    const arr = Array.isArray(parsed.wines) ? parsed.wines : [];
-    const wines: WineCandidate[] = arr.slice(0, 40).flatMap((w, i) => {
-      const name = String(w.name ?? "").trim().slice(0, 120);
-      if (name.replace(/[^a-z]/gi, "").length < 6) return [];
-      const vintage = /^(19\d{2}|20[0-2]\d)$/.test(String(w.vintage ?? "")) ? String(w.vintage) : undefined;
-      const price = Number(w.listPrice);
-      const listPrice = Number.isFinite(price) && price >= 5 && price <= 5000 ? price : undefined;
-      const conf = Number(w.confidence);
-      const ocrConfidence = Number.isFinite(conf) ? Math.max(0.3, Math.min(0.99, conf > 1 ? conf / 100 : conf)) : 0.82;
-      return [
-        {
-          id: `w${i + 1}`,
-          rawName: name,
-          vintage,
-          listPrice,
-          ocrConfidence: Math.round(ocrConfidence * 100) / 100,
-          needsReview: ocrConfidence < 0.75 || !listPrice,
-        },
-      ];
     });
-
-    return NextResponse.json({ wines, currency: parseCurrency(parsed.currency), model });
   } catch (e) {
-    const aborted = e instanceof Error && e.name === "AbortError";
-    console.error("OCR route error", aborted ? "timeout" : e);
-    return fail(aborted ? "Reading timed out. Try a tighter photo of the list." : "List reading failed. Try again or add wines manually.", 500);
+    const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+    throw new OcrError(timedOut ? "Reading timed out. Try a tighter photo of the list." : "List reading failed. Try again or add wines manually.", timedOut ? 504 : 502);
   }
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    console.error("OpenRouter OCR failed", model, res.status, t.slice(0, 500));
+    if (res.status === 401 || res.status === 403) throw new OcrError("OpenRouter key was rejected. Check OPENROUTER_API_KEY in Vercel.", 502, false);
+    if (res.status === 429) throw new OcrError("Rate limited by the model provider - try again in a moment.", 429);
+    if (res.status === 404 || /no endpoints|model not found/i.test(t)) throw new OcrError(`Model "${model}" is unavailable on OpenRouter. Set OCR_MODEL to a vision model.`, 502);
+    throw new OcrError("List reading failed upstream. Try again, or add wines manually.", 502);
+  }
+
+  const data = await res.json().catch(() => null);
+  const content: string = data?.choices?.[0]?.message?.content ?? "";
+  if (!content.trim()) {
+    // Typically means the model burned the token cap thinking, or the provider ignored reasoning:off.
+    console.error("OCR empty content", model, JSON.stringify(data?.usage ?? {}), data?.choices?.[0]?.finish_reason);
+    throw new OcrError("Model returned an empty reading. Try again or add wines manually.", 502);
+  }
+  return parseMenu(content);
+}
+
+// ---- parsing ----
+
+function toPrice(raw: unknown): number | undefined {
+  // "£22 glass / £110" -> the bottle is the biggest figure.
+  const nums = (String(raw ?? "").replace(/,(?=\d{3}\b)/g, "").match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
+  const n = nums.length ? Math.max(...nums) : NaN;
+  return Number.isFinite(n) && n >= 5 && n <= 5000 ? n : undefined;
+}
+
+function toVintage(raw: unknown): string | undefined {
+  const m = String(raw ?? "").match(/\b(19\d{2}|20[0-2]\d)\b/);
+  return m ? m[1] : undefined;
+}
+
+function parseMenu(content: string): Parsed {
+  const text = content.replace(/```[a-z]*\n?/gi, "").trim();
+  let currency: CurrencyCode = "GBP";
+  const rows: { name: string; vintage?: string; price?: number }[] = [];
+
+  if (text.startsWith("{")) {
+    // A fallback model ignoring the line format and answering with JSON.
+    try {
+      const j = JSON.parse(text) as { currency?: unknown; wines?: { name?: unknown; vintage?: unknown; listPrice?: unknown; price?: unknown }[] };
+      currency = parseCurrency(j.currency);
+      for (const w of Array.isArray(j.wines) ? j.wines : []) rows.push({ name: String(w.name ?? ""), vintage: toVintage(w.vintage), price: toPrice(w.listPrice ?? w.price) });
+    } catch {
+      /* fall through to line parsing */
+    }
+  }
+
+  if (!rows.length) {
+    for (const line of text.split(/\r?\n/)) {
+      const l = line.trim();
+      if (!l) continue;
+      const cur = l.match(/^CURRENCY\s*[=:]\s*(\S+)/i);
+      if (cur) {
+        currency = parseCurrency(cur[1]);
+        continue;
+      }
+      if (!l.includes("|")) continue;
+      const [name, vintage, price] = l.split("|").map((p) => p.trim());
+      rows.push({ name: name ?? "", vintage: toVintage(vintage ?? "") ?? toVintage(name), price: toPrice(price) });
+    }
+  }
+
+  const seen = new Set<string>();
+  const wines: WineCandidate[] = [];
+  for (const r of rows) {
+    const name = r.name.replace(/^[\s\-•*\d.)]+(?=[A-Za-zÀ-ÿ])/, "").trim().slice(0, 120);
+    if (name.replace(/[^a-z]/gi, "").length < 6) continue; // headers, fragments
+    const dedupe = `${name.toLowerCase()}|${r.vintage ?? ""}|${r.price ?? ""}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    const ocrConfidence = r.price ? 0.85 : 0.7;
+    wines.push({
+      id: `w${wines.length + 1}`,
+      rawName: name,
+      vintage: r.vintage,
+      listPrice: r.price,
+      ocrConfidence,
+      needsReview: !r.price,
+    });
+    if (wines.length >= MAX_WINES) break;
+  }
+  return { wines, currency };
 }
