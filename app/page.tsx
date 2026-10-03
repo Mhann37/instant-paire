@@ -7,6 +7,49 @@ import { getEntitlement, recordScan } from "@/lib/entitlements";
 
 type Step = "input" | "reading" | "review" | "ranking" | "results";
 
+// Serverless platforms return HTML error pages for oversized payloads, timeouts and
+// crashes. Never call res.json() blindly - read text, then parse, so the user sees
+// a real message instead of "Unexpected token 'A'".
+type ApiError = { error?: string };
+type OcrOk = { wines?: WineCandidate[]; model?: string };
+
+async function postJson<T extends object>(url: string, payload: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text().catch(() => "");
+  let data: T | ApiError | null = null;
+  try {
+    data = text ? (JSON.parse(text) as T | ApiError) : null;
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    const serverMsg = data && "error" in data && typeof data.error === "string" ? data.error : null;
+    throw new Error(serverMsg ?? friendlyHttpError(res.status, text));
+  }
+  if (!data) throw new Error("Unexpected response from server. Try again, or add wines manually.");
+  return data as T;
+}
+
+function friendlyHttpError(status: number, body: string): string {
+  const hint = /payload|too large|body size/i.test(body)
+    ? " Photo too large - try a closer shot of just the list."
+    : /timeout|timed out/i.test(body)
+      ? " The reading took too long. Try a tighter photo of the list."
+      : "";
+  if (status === 404) return `Endpoint not found (${urlTail()}) - the app may need redeploying.${hint}`;
+  if (status === 413) return `Photo too large to process.${hint}`;
+  if (status === 500 || status === 502 || status === 503) return `Server error (${status}).${hint} Add wines manually below meanwhile.`;
+  return `Request failed (${status}).${hint}`;
+}
+
+function urlTail(): string {
+  return typeof window !== "undefined" ? window.location.pathname : "app";
+}
+
 export default function Home() {
   const [dish, setDish] = useState("");
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -28,13 +71,7 @@ export default function Home() {
     try {
       const compressed = await compressImage(f);
       setImageUrl(compressed);
-      const res = await fetch("/api/ocr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: compressed }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "List reading failed");
+      const data = await postJson<OcrOk>("/api/ocr", { image: compressed });
       const parsed = (data.wines ?? []) as WineCandidate[];
       setWines(parsed);
       track("ocr_completed", { wine_count: parsed.length, model: data.model ?? "openrouter" });
@@ -46,7 +83,7 @@ export default function Home() {
     }
   }
 
-  function compressImage(file: File, maxDim = 1600, quality = 0.82): Promise<string> {
+  function compressImage(file: File, maxDim = 1400, quality = 0.75): Promise<string> {
     return new Promise((resolve, reject) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
@@ -102,19 +139,13 @@ export default function Home() {
     setStep("ranking");
     track("rank_requested", { wine_count: clean.length });
     try {
-      const res = await fetch("/api/rank", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ dish: dish.trim(), wines: clean }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Ranking failed");
-      setRanked((data as RankResponse).ranked);
-      setMeta((data as RankResponse).meta);
+      const data = await postJson<RankResponse>("/api/rank", { dish: dish.trim(), wines: clean });
+      setRanked(data.ranked ?? []);
+      setMeta(data.meta ?? null);
       recordScan();
       setScansLeft(getEntitlement().scansLeft);
       setStep("results");
-      track("rank_viewed", { top_score: (data as RankResponse).ranked[0]?.finalScore ?? 0 });
+      track("rank_viewed", { top_score: data.ranked?.[0]?.finalScore ?? 0 });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ranking failed - try again.");
       setStep("review");

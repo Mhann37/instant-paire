@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import type { WineCandidate } from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 45;
+export const maxDuration = 60;
 
 const DEFAULT_MODEL = process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha";
-const MAX_CHARS = 4_500_000; // ~3.3MB base64
+// Vercel serverless request body limit is ~4.5MB; base64 inflates by ~1.33x.
+const MAX_CHARS = 3_400_000;
 
 type OcrWine = {
   name?: unknown;
@@ -14,26 +15,32 @@ type OcrWine = {
   confidence?: unknown;
 };
 
+function fail(error: string, status: number) {
+  return NextResponse.json({ error, wines: [] }, { status });
+}
+
 export async function POST(req: NextRequest) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
-    return NextResponse.json(
-      { error: "Vision OCR not configured yet — add OPENROUTER_API_KEY in Vercel env, or add wines manually below." },
-      { status: 501 }
-    );
+    return fail("Photo reading isn't configured yet. Add OPENROUTER_API_KEY in Vercel, or add wines manually below.", 501);
   }
 
+  let body: { image?: unknown; model?: unknown };
   try {
-    const body = await req.json();
-    const image = String(body.image ?? "");
-    if (!image.startsWith("data:image/")) {
-      return NextResponse.json({ error: "Send the photo as a data URL image." }, { status: 400 });
-    }
-    if (image.length > MAX_CHARS) {
-      return NextResponse.json({ error: "Photo too large — try a smaller or compressed image." }, { status: 413 });
-    }
+    body = await req.json();
+  } catch {
+    return fail("Could not read the upload. Try a smaller photo.", 400);
+  }
 
-    const model = String(body.model ?? DEFAULT_MODEL);
+  const image = typeof body.image === "string" ? body.image : "";
+  if (!image.startsWith("data:image/")) return fail("Send the photo as an image data URL.", 400);
+  if (image.length > MAX_CHARS) return fail("Photo too large - take a closer shot of just the wine list.", 413);
+
+  const model = typeof body.model === "string" && body.model ? body.model : DEFAULT_MODEL;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 55_000);
     const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -42,6 +49,7 @@ export async function POST(req: NextRequest) {
         "HTTP-Referer": "https://instant-paire.vercel.app",
         "X-Title": "Instant Paire",
       },
+      signal: controller.signal,
       body: JSON.stringify({
         model,
         temperature: 0,
@@ -61,19 +69,28 @@ export async function POST(req: NextRequest) {
           },
         ],
       }),
-    });
+    }).finally(() => clearTimeout(timeout));
 
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      console.error("OpenRouter OCR failed", res.status, t.slice(0, 500));
-      return NextResponse.json({ error: "List reading failed — try a clearer photo or add wines manually." }, { status: 502 });
+      console.error("OpenRouter OCR failed", res.status, t.slice(0, 800));
+      if (res.status === 401 || res.status === 403) return fail("OpenRouter key was rejected. Check OPENROUTER_API_KEY in Vercel.", 502);
+      if (res.status === 404 || /no endpoints|model not found/i.test(t)) return fail(`Model "${model}" is unavailable on OpenRouter. Set OPENROUTER_OCR_MODEL to a vision model.`, 502);
+      if (res.status === 429) return fail("Rate limited by the model provider - try again in a moment.", 429);
+      return fail("List reading failed upstream. Try again, or add wines manually.", 502);
     }
 
     const data = await res.json();
-    const content: string = data.choices?.[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(content) as { wines?: OcrWine[] };
-    const arr = Array.isArray(parsed.wines) ? parsed.wines : [];
+    const content: string = data?.choices?.[0]?.message?.content ?? "";
+    let parsed: { wines?: OcrWine[] };
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      console.error("OCR model returned non-JSON", content.slice(0, 400));
+      return fail("Model returned an unexpected format. Try again or add wines manually.", 502);
+    }
 
+    const arr = Array.isArray(parsed.wines) ? parsed.wines : [];
     const wines: WineCandidate[] = arr.slice(0, 40).flatMap((w, i) => {
       const name = String(w.name ?? "").trim().slice(0, 120);
       if (name.replace(/[^a-z]/gi, "").length < 6) return [];
@@ -96,7 +113,8 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ wines, model });
   } catch (e) {
-    console.error("OCR route error", e);
-    return NextResponse.json({ error: "List reading failed — try again or add wines manually." }, { status: 500 });
+    const aborted = e instanceof Error && e.name === "AbortError";
+    console.error("OCR route error", aborted ? "timeout" : e);
+    return fail(aborted ? "Reading timed out. Try a tighter photo of the list." : "List reading failed. Try again or add wines manually.", 500);
   }
 }

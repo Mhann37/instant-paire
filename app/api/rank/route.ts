@@ -4,19 +4,28 @@ import { heuristicEnrich } from "@/lib/enrich";
 import { judgeWine, judgeWithJev, JEV_MODEL } from "@/lib/jev";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 // In-memory cache for wine enrichment (per-instance; upgrade to Vercel KV later
 // by swapping getCached/setCached with @vercel/kv — same key shape).
 const cache = new Map<string, Partial<EnrichedWine>>();
 
+function fail(error: string, status: number) {
+  return NextResponse.json({ error, ranked: [] }, { status });
+}
+
 export async function POST(req: NextRequest) {
+  let body: { dish?: unknown; wines?: unknown };
   try {
-    const body = await req.json();
+    body = await req.json();
+  } catch {
+    return fail("Could not read the request. Try again.", 400);
+  }
+  try {
     const dish: string = String(body.dish ?? "").slice(0, 200);
     const wines: WineCandidate[] = Array.isArray(body.wines) ? body.wines.slice(0, 40) : [];
-    if (!dish.trim()) return NextResponse.json({ error: "Tell us what you're eating first." }, { status: 400 });
-    if (!wines.length) return NextResponse.json({ error: "No wines to rank — rescan the list." }, { status: 400 });
+    if (!dish.trim()) return fail("Tell us what you're eating first.", 400);
+    if (!wines.length) return fail("No wines to rank - rescan the list.", 400);
 
     let enriched = heuristicEnrich(wines);
     let enrichment: RankResponse["meta"]["enrichment"] = "heuristic";
@@ -79,8 +88,9 @@ export async function POST(req: NextRequest) {
     if (wild) wild.role = "Wildcard";
 
     return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning, warnings } } satisfies RankResponse);
-  } catch {
-    return NextResponse.json({ error: "Ranking failed — try again." }, { status: 500 });
+  } catch (e) {
+    console.error("rank failed", e);
+    return fail("Ranking failed - try again.", 500);
   }
 }
 
