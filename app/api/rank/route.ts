@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { EnrichedWine, RankResponse, RankedWine, WineCandidate } from "@/lib/types";
 import { heuristicEnrich } from "@/lib/enrich";
-import { judgeWine } from "@/lib/jev";
+import { judgeWine, judgeWithJev, JEV_MODEL } from "@/lib/jev";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -38,15 +38,35 @@ export async function POST(req: NextRequest) {
     const priced = enriched.filter((w) => w.listPrice).sort((a, b) => (a.listPrice ?? 0) - (b.listPrice ?? 0));
     const cheapSet = new Set(priced.slice(0, Math.ceil(priced.length / 3)).map((w) => w.id));
 
+    // --- Decisioning: real Jev via OpenRouter when key present, else heuristic ---
+    let decisioning: RankResponse["meta"]["decisioning"] = "heuristic";
+    let jevScores = new Map<string, { pairingFit: number; valueScore: number; confidence: number }>();
+    if (process.env.OPENROUTER_API_KEY) {
+      try {
+        jevScores = await judgeWithJev(enriched, dish, process.env.OPENROUTER_API_KEY, process.env.JEV_MODEL ?? JEV_MODEL);
+        decisioning = "jev";
+      } catch (e) {
+        console.error("Jev decisioning failed, using heuristic", e);
+        warnings.push("Live sommelier judgments unavailable - used built-in scoring.");
+      }
+    }
+
     const ranked: RankedWine[] = enriched.map((w) => {
       const j = judgeWine(w, dish);
-      let valueScore = j.valueScore;
+      const live = jevScores.get(w.id);
+      const pairingFit = live?.pairingFit ?? j.pairingFit;
+      let valueScore = live?.valueScore ?? j.valueScore;
+      // Blend Jev confidence with data-quality reality (OCR + groundedness)
+      const confidence = live
+        ? Math.max(0.3, Math.min(0.99, Math.round(((live.confidence * 0.7) + (j.confidence * 0.3)) * 100) / 100))
+        : j.confidence;
       if (!w.grounded && cheapSet.has(w.id) && w.listPrice) valueScore = Math.min(0.9, valueScore + 0.12);
-      const finalScore = Math.round((j.pairingFit / 2) * 50 + valueScore * 30 + (j.qualityScore / 2) * 20);
+      const finalScore = Math.round((pairingFit / 2) * 50 + valueScore * 30 + (j.qualityScore / 2) * 20);
       // Cap confidence-displayed picks when OCR shaky or ungrounded
       const cappedFinal = w.ocrConfidence < 0.6 || !w.listPrice ? Math.min(finalScore, 69) : finalScore;
-      const band = j.confidence >= 0.8 ? "High" : j.confidence >= 0.62 ? "Medium" : "Low";
-      return { ...w, pairingFit: j.pairingFit, valueScore, qualityScore: j.qualityScore, finalScore: cappedFinal, confidence: j.confidence, confidenceBand: band, why: j.why, flags: j.flags };
+      const band = confidence >= 0.8 ? "High" : confidence >= 0.62 ? "Medium" : "Low";
+      const flags = live ? [...j.flags, "Judged live by Jev"] : j.flags;
+      return { ...w, pairingFit, valueScore, qualityScore: j.qualityScore, finalScore: cappedFinal, confidence, confidenceBand: band, why: j.why, flags };
     });
 
     ranked.sort((a, b) => b.finalScore - a.finalScore);
@@ -58,7 +78,7 @@ export async function POST(req: NextRequest) {
     const wild = ranked.find((w) => !w.role && w.category !== ranked[0]?.category && w.pairingFit >= 1.2 && w.confidence >= 0.55);
     if (wild) wild.role = "Wildcard";
 
-    return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning: process.env.TYPESAFE_API_KEY ? "jev" : "heuristic", warnings } } satisfies RankResponse);
+    return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning, warnings } } satisfies RankResponse);
   } catch {
     return NextResponse.json({ error: "Ranking failed — try again." }, { status: 500 });
   }

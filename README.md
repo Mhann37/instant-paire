@@ -17,22 +17,24 @@ Open http://localhost:3000.
 
 Copy `.env.example` to `.env.local`:
 
-- `OPENROUTER_API_KEY` — **required for photo reading**. Models via `OPENROUTER_OCR_MODEL` (default `google/gemini-2.5-flash`).
+- `OPENROUTER_API_KEY` — **required**. Powers photo OCR, wine enrichment, and live Jev decisioning. Models:
+  - `OPENROUTER_OCR_MODEL` (default `stealth/space-bunny-alpha`) — vision list extraction
+  - `OPENROUTER_MODEL` (default `stealth/space-bunny-alpha`) — enrichment
+  - `JEV_MODEL` (default `typesafe/jev-1.13`) — System One pairing/value judgments via `POST https://openrouter.ai/api/alpha/decisions`
 - `NEXT_PUBLIC_GA4_ID` — GA4 measurement ID. Empty = analytics disabled.
-- `OPENAI_API_KEY` (+ `OPENAI_MODEL`, default `gpt-4o-mini`) — upgrades wine enrichment from built-in heuristics to live retail + quality data.
-- `TYPESAFE_API_KEY` — upgrades decisioning from the deterministic fallback to real Jev System One judgments. See `lib/jev.ts` (`jevRequestBody`).
+- `OPENAI_API_KEY` (legacy fallback for enrichment only — OpenRouter preferred).
 
 ## How it works
 
 1. Photo is compressed on-device (max 1600px JPEG), then read by a vision model via OpenRouter (`POST /api/ocr` -> structured `{name, vintage, listPrice, confidence}` JSON).
-2. `POST /api/rank` enriches (heuristic now, batched LLM when key set, cached) and scores pairing/value/quality with confidence bands High/Medium/Low.
+2. `POST /api/rank` enriches (heuristic now, batched LLM when key set, cached), then calls Jev `typesafe/jev-1.13` via the OpenRouter Decisions API — one request, parallel `pair_*` Score + `value_*` Noul questions per wine — and blends Jev answers with data-quality reality (OCR, groundedness) into confidence bands High/Medium/Low. Falls back to built-in scoring if Jev is unreachable.
 3. UI shows Best Match / Best Value / Wildcard + full ranked list. Low-OCR or unconfirmed entries are capped and flagged, never hidden.
 
 ## Paths
 
 - `/` — the whole app
-- `/api/rank` — ranking
-- `/api/ocr` — 501 stub (server OCR upgrade point)
+- `/api/rank` — ranking (enrich + Jev)
+- `/api/ocr` — vision list extraction (501 without `OPENROUTER_API_KEY`)
 - `/api/billing/checkout` — 501 stub (Stripe upgrade point, gated by `lib/entitlements.ts`)
 
 ## Deploy
