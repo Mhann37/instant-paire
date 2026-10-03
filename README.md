@@ -21,11 +21,17 @@ Copy `.env.example` to `.env.local`:
   - `OCR_MODEL` (default `inclusionai/ling-3.0-flash-vl`) — vision list extraction, run with reasoning off and a token cap for speed
   - `OCR_FALLBACK_MODEL` (default `google/gemini-3.8-flash`) — one retry if the primary errors or finds no wines
   - (the old `OPENROUTER_OCR_MODEL` variable is no longer read - delete it from Vercel if set)
-  - `OPENROUTER_MODEL` (default `stealth/space-bunny-alpha`) — enrichment
+  - `ENRICH_MODEL` (default `openai/gpt-6-luna`) and `ENRICH_FALLBACK_MODEL` (default `google/gemini-3.8-flash`) — wine style/retail-price lookup. (The old `OPENROUTER_MODEL` variable is no longer read. `stealth/space-bunny-alpha` must not be used: mandatory max-effort reasoning, and it expires 2026-10-05.)
   - `JEV_MODEL` (default `typesafe/jev-1.13`) — System One pairing/value judgments via `POST https://openrouter.ai/api/alpha/decisions`
 - `NEXT_PUBLIC_GA4_ID` — GA4 measurement ID. Empty = analytics disabled.
 - `OPENAI_API_KEY` (legacy fallback for enrichment only — OpenRouter preferred).
 - `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (or Vercel KV's `KV_REST_API_URL` + `KV_REST_API_TOKEN`) — **strongly recommended in production.** One shared store for rate limits, the per-device scan quota, the enrichment cache and the price index. Without it everything falls back to per-instance memory: limits reset on cold starts and the price index never accumulates.
+
+## Debugging
+
+Add `?debug` to the page URL (e.g. `https://instant-paire.vercel.app/?debug`) and run a scan: a dark panel under the results shows OCR model + timings, enrichment cache hits, which enrichment model answered, Jev timing, and the reason for any failure.
+
+Reasoning control differs per model (some can turn it off, some are mandatory-reasoning), so `lib/openrouter.ts` tries reasoning-off, then low effort, then the model default, and remembers what worked.
 
 ## How it works
 
