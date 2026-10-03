@@ -50,5 +50,6 @@ export type RankResponse = {
     warnings: string[];
     currency: CurrencyCode;
     marketMatches: number; // wines with enough price-index data to compare
+    diagnostics?: string[]; // timings / model used / errors; shown in the UI only with ?debug
   };
 };

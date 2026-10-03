@@ -4,6 +4,7 @@ import { parseCurrency, type CurrencyCode } from "@/lib/currency";
 import { FREE_SCANS_LIFETIME } from "@/lib/limits";
 import { getDevice, rateLimit, setDeviceCookie } from "@/lib/guard";
 import { peek } from "@/lib/store";
+import { LlmHttpError, openrouterChat } from "@/lib/openrouter";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -14,8 +15,6 @@ export const maxDuration = 60;
 // finds nothing, one retry goes to a stronger fallback model.
 const PRIMARY_MODEL = process.env.OCR_MODEL ?? "inclusionai/ling-3.0-flash-vl";
 const FALLBACK_MODEL = process.env.OCR_FALLBACK_MODEL ?? "google/gemini-3.8-flash";
-// Overridable so the route can be exercised against a local stub.
-const OR_BASE = process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1";
 const PRIMARY_TIMEOUT_MS = 22_000;
 const FALLBACK_TIMEOUT_MS = 28_000;
 // Vercel serverless request body limit is ~4.5MB; base64 inflates by ~1.33x.
@@ -75,15 +74,16 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
 
   const started = Date.now();
   let lastErr: OcrError | null = null;
-  const attempts: [string, number][] = [[PRIMARY_MODEL, PRIMARY_TIMEOUT_MS]];
-  if (FALLBACK_MODEL && FALLBACK_MODEL !== PRIMARY_MODEL) attempts.push([FALLBACK_MODEL, FALLBACK_TIMEOUT_MS]);
+  // Models with mandatory reasoning (e.g. Gemini Flash) spend part of max_tokens on thinking, hence the bigger cap.
+  const attempts: [string, number, number][] = [[PRIMARY_MODEL, PRIMARY_TIMEOUT_MS, 2400]];
+  if (FALLBACK_MODEL && FALLBACK_MODEL !== PRIMARY_MODEL) attempts.push([FALLBACK_MODEL, FALLBACK_TIMEOUT_MS, 8000]);
 
-  for (const [model, timeoutMs] of attempts) {
+  for (const [model, timeoutMs, maxTokens] of attempts) {
     try {
-      const parsed = await readMenu(model, image, apiKey, timeoutMs);
+      const parsed = await readMenu(model, image, apiKey, timeoutMs, maxTokens);
       if (!parsed.wines.length) throw new OcrError("No wines found in the photo.", 422);
       console.info("ocr ok", JSON.stringify({ model, wines: parsed.wines.length, ms: Date.now() - started, fellBack: model !== PRIMARY_MODEL }));
-      return NextResponse.json({ wines: parsed.wines, currency: parsed.currency, model });
+      return NextResponse.json({ wines: parsed.wines, currency: parsed.currency, model, ms: Date.now() - started });
     } catch (e) {
       lastErr = e instanceof OcrError ? e : new OcrError("List reading failed. Try again or add wines manually.", 500);
       console.error("ocr attempt failed", JSON.stringify({ model, ms: Date.now() - started, status: lastErr.status, msg: lastErr.message }));
@@ -94,24 +94,15 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
   return fail(err.message, err.status);
 }
 
-async function readMenu(model: string, image: string, apiKey: string, timeoutMs: number): Promise<Parsed> {
-  let res: Response;
+async function readMenu(model: string, image: string, apiKey: string, timeoutMs: number, maxTokens: number): Promise<Parsed> {
+  let data;
   try {
-    res = await fetch(`${OR_BASE}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://instant-paire.vercel.app",
-        "X-Title": "Instant Paire",
-      },
-      signal: AbortSignal.timeout(timeoutMs),
-      body: JSON.stringify({
+    ({ data } = await openrouterChat(
+      apiKey,
+      {
         model,
         temperature: 0,
-        max_tokens: 2400,
-        reasoning: { enabled: false },
-        include_reasoning: false,
+        max_tokens: maxTokens,
         provider: { sort: "latency" },
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
@@ -123,23 +114,21 @@ async function readMenu(model: string, image: string, apiKey: string, timeoutMs:
             ],
           },
         ],
-      }),
-    });
+      },
+      timeoutMs,
+    ));
   } catch (e) {
+    if (e instanceof LlmHttpError) {
+      console.error("OpenRouter OCR failed", model, e.status, e.body.slice(0, 500));
+      if (e.status === 401 || e.status === 403) throw new OcrError("OpenRouter key was rejected. Check OPENROUTER_API_KEY in Vercel.", 502, false);
+      if (e.status === 429) throw new OcrError("Rate limited by the model provider - try again in a moment.", 429);
+      if (e.status === 404 || /no endpoints|model not found/i.test(e.body)) throw new OcrError(`Model "${model}" is unavailable on OpenRouter. Set OCR_MODEL to a vision model.`, 502);
+      throw new OcrError("List reading failed upstream. Try again, or add wines manually.", 502);
+    }
     const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
     throw new OcrError(timedOut ? "Reading timed out. Try a tighter photo of the list." : "List reading failed. Try again or add wines manually.", timedOut ? 504 : 502);
   }
 
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    console.error("OpenRouter OCR failed", model, res.status, t.slice(0, 500));
-    if (res.status === 401 || res.status === 403) throw new OcrError("OpenRouter key was rejected. Check OPENROUTER_API_KEY in Vercel.", 502, false);
-    if (res.status === 429) throw new OcrError("Rate limited by the model provider - try again in a moment.", 429);
-    if (res.status === 404 || /no endpoints|model not found/i.test(t)) throw new OcrError(`Model "${model}" is unavailable on OpenRouter. Set OCR_MODEL to a vision model.`, 502);
-    throw new OcrError("List reading failed upstream. Try again, or add wines manually.", 502);
-  }
-
-  const data = await res.json().catch(() => null);
   const content: string = data?.choices?.[0]?.message?.content ?? "";
   if (!content.trim()) {
     // Typically means the model burned the token cap thinking, or the provider ignored reasoning:off.

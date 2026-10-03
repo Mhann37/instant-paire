@@ -10,13 +10,13 @@ import { CategoryDot, MiniRow, RankCard } from "@/components/Results";
 
 type Phase = "input" | "working" | "results";
 type Stage = "reading" | "pairing";
-type OcrResult = { wines: WineCandidate[]; currency: CurrencyCode };
+type OcrResult = { wines: WineCandidate[]; currency: CurrencyCode; info: string };
 
 // Serverless platforms return HTML error pages for oversized payloads, timeouts and
 // crashes. Never call res.json() blindly - read text, then parse, so the user sees
 // a real message instead of "Unexpected token 'A'".
 type ApiError = { error?: string };
-type OcrOk = { wines?: WineCandidate[]; currency?: string; model?: string };
+type OcrOk = { wines?: WineCandidate[]; currency?: string; model?: string; ms?: number };
 
 async function postJson<T extends object>(url: string, payload: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -109,6 +109,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [scansLeft, setScansLeft] = useState<number | null>(null);
   const [rated, setRated] = useState<Record<string, 1 | -1>>({});
+  const [debugLines, setDebugLines] = useState<string[]>([]); // only populated with ?debug in the URL
 
   const libraryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
@@ -117,6 +118,7 @@ export default function Home() {
   const resultsRef = useRef<HTMLDivElement>(null);
   // The OCR call starts the moment a photo is chosen (while the user is still typing their dish).
   const ocr = useRef<{ promise: Promise<OcrResult> | null; status: "idle" | "reading" | "ready" | "failed" }>({ promise: null, status: "idle" });
+  const ocrInfo = useRef("");
   const photoId = useRef(0);
   const runId = useRef(0);
 
@@ -173,7 +175,7 @@ export default function Home() {
       const parsed = data.wines ?? [];
       if (!parsed.length) throw new Error("Couldn't read any wines - try a straighter, well-lit photo, or type them in.");
       track("ocr_completed", { wine_count: parsed.length, model: data.model ?? "openrouter", ms: Math.round(performance.now() - t0) });
-      return { wines: parsed, currency: parseCurrency(data.currency) };
+      return { wines: parsed, currency: parseCurrency(data.currency), info: `ocr ${data.model ?? "?"} server ${data.ms ?? "?"}ms, total ${Math.round(performance.now() - t0)}ms` };
     })();
     ocr.current = { promise, status: "reading" };
     promise.then(
@@ -182,6 +184,7 @@ export default function Home() {
         ocr.current.status = "ready";
         setWines(r.wines);
         setCurrency(r.currency);
+        ocrInfo.current = r.info;
       },
       (e) => {
         if (id !== photoId.current) return;
@@ -253,6 +256,7 @@ export default function Home() {
       setRanked(data.ranked ?? []);
       setMeta(data.meta ?? null);
       setRated({});
+      setDebugLines(new URLSearchParams(window.location.search).has("debug") ? [ocrInfo.current, ...(data.meta?.diagnostics ?? []), `total ${Math.round(performance.now() - t0)}ms`].filter(Boolean) : []);
       recordScan();
       setScansLeft(getEntitlement().scansLeft);
       setPhase("results");
@@ -521,6 +525,10 @@ export default function Home() {
                 </>
               )}
             </div>
+
+            {debugLines.length > 0 && (
+              <pre className="mt-6 overflow-x-auto whitespace-pre-wrap rounded-2xl bg-ink p-4 text-[11px] leading-relaxed text-[#e9cbd5]">{debugLines.join("\n")}</pre>
+            )}
 
             <details className="mt-6 rounded-2xl border border-line bg-white p-4">
               <summary className="cursor-pointer text-sm font-medium">

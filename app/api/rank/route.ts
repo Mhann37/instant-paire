@@ -7,6 +7,7 @@ import { FREE_SCANS_LIFETIME } from "@/lib/limits";
 import { getDevice, rateLimit, setDeviceCookie } from "@/lib/guard";
 import { getJsonMany, incr, peek, setJsonMany } from "@/lib/store";
 import { wineKey } from "@/lib/wine-key";
+import { openrouterChat } from "@/lib/openrouter";
 import { lookupMarket, recordObservations } from "@/lib/market";
 
 export const runtime = "nodejs";
@@ -14,6 +15,10 @@ export const maxDuration = 60;
 
 const ENRICH_TTL_SEC = 60 * 60 * 24 * 30;
 const ENRICH_CHUNK = 20;
+// NOT the old stealth/space-bunny-alpha: it has mandatory max-effort reasoning (slow, can't be turned
+// off) and expires 2026-10-05. Luna is cheap and can run with reasoning off; Gemini Flash is the backup.
+const ENRICH_MODEL = process.env.ENRICH_MODEL ?? "openai/gpt-6-luna";
+const ENRICH_FALLBACK_MODEL = process.env.ENRICH_FALLBACK_MODEL ?? "google/gemini-3.8-flash";
 const CATEGORIES = ["red", "white", "rose", "sparkling", "dessert"] as const;
 
 function fail(error: string, status: number) {
@@ -75,13 +80,18 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
     let enriched = heuristicEnrich(wines);
     let enrichment: RankResponse["meta"]["enrichment"] = "heuristic";
     const warnings: string[] = [];
+    const diagnostics: string[] = [];
 
     // Upgrade with LLM when key present (single batched call, via OpenRouter).
     if (process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY) {
       try {
-        enriched = await llmEnrich(dish, enriched);
+        const t0 = Date.now();
+        enriched = await llmEnrich(dish, enriched, diagnostics);
+        diagnostics.push(`enrich total ${Date.now() - t0}ms`);
         enrichment = "llm";
-      } catch {
+      } catch (e) {
+        console.error("enrichment failed", e);
+        diagnostics.push(`enrich FAILED: ${e instanceof Error ? e.message.slice(0, 200) : "unknown"}`);
         warnings.push("Live wine lookup failed — used on-device estimates instead.");
       }
     } else {
@@ -100,10 +110,13 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
     let jevScores = new Map<string, { pairingFit: number; valueScore: number; confidence: number }>();
     if (process.env.OPENROUTER_API_KEY) {
       try {
+        const tj = Date.now();
         jevScores = await judgeWithJev(enriched, dish, process.env.OPENROUTER_API_KEY, process.env.JEV_MODEL ?? JEV_MODEL, currency);
         decisioning = "jev";
+        diagnostics.push(`jev ${Date.now() - tj}ms`);
       } catch (e) {
         console.error("Jev decisioning failed, using heuristic", e);
+        diagnostics.push(`jev FAILED: ${e instanceof Error ? e.message.slice(0, 200) : "unknown"}`);
         warnings.push("Live sommelier judgments unavailable - used built-in scoring.");
       }
     }
@@ -162,7 +175,7 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
     await incr(scanKey);
     after(() => recordObservations(wines, currency, venue));
 
-    return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning, warnings, currency, marketMatches } } satisfies RankResponse);
+    return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning, warnings, currency, marketMatches, diagnostics } } satisfies RankResponse);
   } catch (e) {
     console.error("rank failed", e);
     return fail("Ranking failed - try again.", 500);
@@ -180,13 +193,9 @@ function sanitiseAffinity(raw: unknown): Record<string, number> {
   return out;
 }
 
-async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedWine[]> {
+async function llmEnrich(dish: string, wines: EnrichedWine[], diagnostics: string[]): Promise<EnrichedWine[]> {
   const orKey = process.env.OPENROUTER_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
-  const useOpenRouter = Boolean(orKey);
-  const model = useOpenRouter
-    ? (process.env.OPENROUTER_MODEL ?? "stealth/space-bunny-alpha")
-    : (process.env.OPENAI_MODEL ?? "gpt-4o-mini");
 
   // Shared cache (Redis when configured), keyed on the wine itself - ids are per-scan.
   const keys = wines.map((w) => `enr:${wineKey(w.rawName, w.vintage)}`);
@@ -198,13 +207,37 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
   });
 
   const uncached = wines.filter((_, i) => !byKey.has(keys[i]));
+  diagnostics.push(`enrich cache ${wines.length - uncached.length}/${wines.length} hit`);
   if (uncached.length) {
     const idToKey = new Map(wines.map((w, i) => [w.id, keys[i]]));
-    const endpoint = useOpenRouter ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${useOpenRouter ? orKey! : openaiKey!}`,
-      "Content-Type": "application/json",
-      ...(useOpenRouter ? { "HTTP-Referer": "https://instant-paire.vercel.app", "X-Title": "Instant Paire" } : {}),
+
+    const askModel = async (model: string, prompt: string): Promise<LlmWineItem[]> => {
+      const body = {
+        model,
+        temperature: 0.2,
+        max_tokens: 6000, // mandatory-reasoning models spend part of this on thinking
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "Return only JSON: {wines: [...]}. Never invent vintages. Use null when unsure." },
+          { role: "user", content: prompt },
+        ],
+      };
+      let content: string | undefined;
+      if (orKey) {
+        content = (await openrouterChat(orKey, body, 25_000)).data.choices?.[0]?.message?.content;
+      } else {
+        // Legacy OpenAI-direct path (no OpenRouter key).
+        const res = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${openaiKey!}`, "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(25_000),
+          body: JSON.stringify({ ...body, model: process.env.OPENAI_MODEL ?? "gpt-4o-mini" }),
+        });
+        if (!res.ok) throw new Error(`LLM ${res.status}`);
+        content = (await res.json()).choices?.[0]?.message?.content;
+      }
+      const parsed = JSON.parse(content ?? "{}") as { wines?: LlmWineItem[] };
+      return parsed.wines ?? [];
     };
 
     // Two parallel halves instead of one big call: roughly halves the wall-clock time on long lists.
@@ -213,31 +246,25 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
 
     const runChunk = async (chunk: EnrichedWine[]) => {
       const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(chunk.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        signal: AbortSignal.timeout(25_000),
-        body: JSON.stringify({
-          model,
-          temperature: 0.2,
-          max_tokens: 3000,
-          response_format: { type: "json_object" },
-          // Lookup, not deliberation: skip the thinking tokens (OpenRouter only).
-          ...(useOpenRouter ? { reasoning: { enabled: false }, include_reasoning: false } : {}),
-          messages: [
-            { role: "system", content: "Return only JSON: {wines: [...]}. Never invent vintages. Use null when unsure." },
-            { role: "user", content: prompt },
-          ],
-        }),
-      });
-      if (!res.ok) throw new Error(`LLM ${res.status}`);
-      const data = await res.json();
-      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? "{}") as { wines?: LlmWineItem[] };
-      return parsed.wines ?? [];
+      const models = orKey ? [ENRICH_MODEL, ENRICH_FALLBACK_MODEL].filter((m, i, a) => m && a.indexOf(m) === i) : ["openai"];
+      let lastErr: unknown;
+      for (const model of models) {
+        const t = Date.now();
+        try {
+          const items = await askModel(model, prompt);
+          diagnostics.push(`enrich ${model} ${Date.now() - t}ms (${items.length} wines)`);
+          return items;
+        } catch (e) {
+          lastErr = e;
+          console.error("enrichment attempt failed", model, e);
+          diagnostics.push(`enrich ${model} failed after ${Date.now() - t}ms: ${e instanceof Error ? e.message.slice(0, 160) : "unknown"}`);
+        }
+      }
+      throw lastErr;
     };
 
     const settled = await Promise.allSettled(chunks.map(runChunk));
-    if (settled.every((r) => r.status === "rejected")) throw new Error("All enrichment calls failed");
+    if (settled.every((r) => r.status === "rejected")) throw (settled[0] as PromiseRejectedResult).reason;
     const fresh: [string, Partial<EnrichedWine>][] = [];
     for (const r of settled) {
       if (r.status !== "fulfilled") continue;
