@@ -4,6 +4,8 @@ import { useMemo, useRef, useState } from "react";
 import type { RankedWine, RankResponse, WineCandidate } from "@/lib/types";
 import { track } from "@/lib/analytics";
 import { getEntitlement, recordScan } from "@/lib/entitlements";
+import { CURRENCIES, CURRENCY_CODES, parseCurrency, type CurrencyCode } from "@/lib/currency";
+import { getTaste, recordRating } from "@/lib/taste";
 
 type Step = "input" | "reading" | "review" | "ranking" | "results";
 
@@ -11,7 +13,7 @@ type Step = "input" | "reading" | "review" | "ranking" | "results";
 // crashes. Never call res.json() blindly - read text, then parse, so the user sees
 // a real message instead of "Unexpected token 'A'".
 type ApiError = { error?: string };
-type OcrOk = { wines?: WineCandidate[]; model?: string };
+type OcrOk = { wines?: WineCandidate[]; currency?: string; model?: string };
 
 async function postJson<T extends object>(url: string, payload: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -64,6 +66,9 @@ export default function Home() {
   const [step, setStep] = useState<Step>("input");
   const [error, setError] = useState<string | null>(null);
   const [scansLeft, setScansLeft] = useState<number | null>(null);
+  const [currency, setCurrency] = useState<CurrencyCode>("GBP");
+  const [venue, setVenue] = useState("");
+  const [rated, setRated] = useState<Record<string, 1 | -1>>({});
   const libraryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
 
@@ -87,6 +92,7 @@ export default function Home() {
       const data = await postJson<OcrOk>("/api/ocr", { image: compressed });
       const parsed = (data.wines ?? []) as WineCandidate[];
       setWines(parsed);
+      setCurrency(parseCurrency(data.currency));
       track("ocr_completed", { wine_count: parsed.length, model: data.model ?? "openrouter" });
       setStep("review");
       if (!parsed.length) setError("Couldn't read any wines - try a straighter, well-lit photo, or add them manually below.");
@@ -155,9 +161,16 @@ export default function Home() {
     setStep("ranking");
     track("rank_requested", { wine_count: clean.length });
     try {
-      const data = await postJson<RankResponse>("/api/rank", { dish: dish.trim(), wines: clean });
+      const data = await postJson<RankResponse>("/api/rank", {
+        dish: dish.trim(),
+        wines: clean,
+        currency,
+        venue: venue.trim() || undefined,
+        taste: { affinity: getTaste().affinity },
+      });
       setRanked(data.ranked ?? []);
       setMeta(data.meta ?? null);
+      setRated({});
       recordScan();
       setScansLeft(getEntitlement().scansLeft);
       setStep("results");
@@ -166,6 +179,19 @@ export default function Home() {
       setError(e instanceof Error ? e.message : "Ranking failed - try again.");
       setStep("review");
     }
+  }
+
+  function rate(w: RankedWine, rating: 1 | -1) {
+    if (rated[w.id]) return;
+    setRated((r) => ({ ...r, [w.id]: rating }));
+    recordRating(w.category, rating);
+    track("wine_rated", { rating, category: w.category });
+    // Anonymous outcome data for calibrating pairings; failure is irrelevant to the user.
+    fetch("/api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: w.rawName, vintage: w.vintage, category: w.category, dish: dish.trim(), rating }),
+    }).catch(() => {});
   }
 
   function reset() {
@@ -200,6 +226,14 @@ export default function Home() {
             placeholder="e.g. ribeye + fries"
             autoComplete="off"
             className="mt-2 w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-[15px] outline-none placeholder:text-neutral-400 focus:border-neutral-900"
+          />
+          <input
+            value={venue}
+            onChange={(e) => setVenue(e.target.value)}
+            aria-label="Restaurant (optional)"
+            placeholder="Restaurant (optional)"
+            autoComplete="off"
+            className="mt-2 w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-2.5 text-sm outline-none placeholder:text-neutral-400 focus:border-neutral-900"
           />
 
           <div className="mt-5">
@@ -270,7 +304,19 @@ export default function Home() {
             <div className="mt-5">
               <div className="flex items-center justify-between">
                 <p className="text-sm font-medium">Wines found ({wines.length}) — tap to fix</p>
-                <button onClick={addManual} className="text-xs font-medium underline underline-offset-4">+ Add manually</button>
+                <div className="flex items-center gap-3">
+                  <select
+                    value={currency}
+                    onChange={(e) => setCurrency(e.target.value as CurrencyCode)}
+                    aria-label="Menu currency"
+                    className="rounded-lg border border-neutral-200 bg-white px-1.5 py-0.5 text-xs"
+                  >
+                    {CURRENCY_CODES.map((c) => (
+                      <option key={c} value={c}>{c} {CURRENCIES[c].symbol.trim()}</option>
+                    ))}
+                  </select>
+                  <button onClick={addManual} className="text-xs font-medium underline underline-offset-4">+ Add manually</button>
+                </div>
               </div>
               <div className="mt-2 space-y-2">
                 {wines.map((w) => (
@@ -284,7 +330,7 @@ export default function Home() {
                     <input
                       defaultValue={w.listPrice ?? ""}
                       onChange={(e) => updateWine(w.id, { listPrice: parsePrice(e.target.value) })}
-                      placeholder="£"
+                      placeholder={CURRENCIES[currency].symbol.trim()}
                       inputMode="decimal"
                       aria-label="List price"
                       className="w-16 rounded-lg bg-neutral-100 px-2 py-1 text-right text-sm outline-none"
@@ -314,7 +360,7 @@ export default function Home() {
             ))}
             <div className="grid gap-3">
               {top3.map((w) => (
-                <RankCard key={w.id} wine={w} featured />
+                <RankCard key={w.id} wine={w} currency={meta?.currency ?? currency} featured rated={rated[w.id]} onRate={rate} />
               ))}
             </div>
             {rest.length > 0 && (
@@ -322,7 +368,7 @@ export default function Home() {
                 <h2 className="mb-2 mt-6 text-xs font-semibold uppercase tracking-widest text-neutral-400">Rest of the list</h2>
                 <div className="grid gap-2">
                   {rest.map((w) => (
-                    <RankCard key={w.id} wine={w} />
+                    <RankCard key={w.id} wine={w} currency={meta?.currency ?? currency} rated={rated[w.id]} onRate={rate} />
                   ))}
                 </div>
               </>
@@ -339,13 +385,17 @@ export default function Home() {
           <p className="mx-auto mt-1 max-w-md text-xs leading-relaxed text-neutral-400">
             Pairing and value scores are estimates from the photo plus built-in wine knowledge. Always confirm the exact wine and price with the menu or staff.
           </p>
+          <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-neutral-400">
+            We anonymously save wine names and list prices (we don&apos;t store your photo or any personal details) to build a market price guide.
+          </p>
         </footer>
       </main>
     </div>
   );
 }
 
-function RankCard({ wine, featured }: { wine: RankedWine; featured?: boolean }) {
+function RankCard({ wine, featured, currency, rated, onRate }: { wine: RankedWine; featured?: boolean; currency: CurrencyCode; rated?: 1 | -1; onRate: (w: RankedWine, r: 1 | -1) => void }) {
+  const sym = CURRENCIES[currency].symbol;
   const bandColor = wine.confidenceBand === "High" ? "bg-neutral-900 text-white" : wine.confidenceBand === "Medium" ? "bg-neutral-200 text-neutral-800" : "bg-neutral-100 text-neutral-500";
   return (
     <article className={`rounded-3xl border p-5 ${featured ? "border-neutral-900" : "border-neutral-200"} bg-white`}>
@@ -354,7 +404,7 @@ function RankCard({ wine, featured }: { wine: RankedWine; featured?: boolean }) 
           {wine.role && <span className={`mb-1.5 inline-block rounded-full px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-wider ${featured ? "bg-neutral-900 text-white" : "bg-neutral-100 text-neutral-700"}`}>{wine.role}</span>}
           <h3 className="text-lg font-semibold leading-snug tracking-tight">{wine.rawName || "Unnamed wine"}</h3>
           <p className="mt-0.5 text-xs text-neutral-500">
-            {wine.listPrice ? `£${wine.listPrice} on list` : "Price not read"}{wine.typicalRetailGBP ? ` · ~£${wine.typicalRetailGBP} retail est.` : ""} · {wine.style}
+            {wine.listPrice ? `${sym}${wine.listPrice} on list` : "Price not read"}{wine.typicalRetailGBP ? ` · ~£${wine.typicalRetailGBP} retail est.` : ""} · {wine.style}
           </p>
         </div>
         <div className="shrink-0 text-right">
@@ -368,6 +418,22 @@ function RankCard({ wine, featured }: { wine: RankedWine; featured?: boolean }) 
         <span>Pairing {wine.pairingFit.toFixed(1)}/2</span>
         <span>Value {Math.round(wine.valueScore * 100)}%</span>
         <span className="ml-auto">OCR {Math.round(wine.ocrConfidence * 100)}%</span>
+      </div>
+      {wine.market && (
+        <p className="mt-2 text-xs text-neutral-500">
+          Typically £{wine.market.medianGBP} on menus (£{wine.market.minGBP}-£{wine.market.maxGBP}, {wine.market.n} lists)
+        </p>
+      )}
+      <div className="mt-3 flex items-center gap-2 text-xs">
+        {rated ? (
+          <span className="text-neutral-400">Thanks - your taste profile is updated.</span>
+        ) : (
+          <>
+            <span className="text-neutral-400">Ordered it?</span>
+            <button onClick={() => onRate(wine, 1)} className="rounded-full border border-neutral-200 px-2.5 py-1 font-medium hover:border-neutral-900">Loved it</button>
+            <button onClick={() => onRate(wine, -1)} className="rounded-full border border-neutral-200 px-2.5 py-1 font-medium hover:border-neutral-900">Not for me</button>
+          </>
+        )}
       </div>
     </article>
   );

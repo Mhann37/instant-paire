@@ -2,7 +2,7 @@
 // Later: plug Clerk + Stripe here without touching UI — just replace the bodies
 // and gate `canSeeFullList` / `canScan`.
 
-const FREE_SCANS_LIFETIME = 25;
+import { FREE_SCANS_LIFETIME } from "./limits";
 
 export type Entitlement = {
   allowed: boolean;
