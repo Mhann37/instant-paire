@@ -22,8 +22,8 @@ export async function POST(req: NextRequest) {
     let enrichment: RankResponse["meta"]["enrichment"] = "heuristic";
     const warnings: string[] = [];
 
-    // Upgrade with LLM when key present (single batched call).
-    if (process.env.OPENAI_API_KEY) {
+    // Upgrade with LLM when key present (single batched call, via OpenRouter).
+    if (process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY) {
       try {
         enriched = await llmEnrich(dish, enriched);
         enrichment = "llm";
@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
         warnings.push("Live wine lookup failed — used on-device estimates instead.");
       }
     } else {
-      warnings.push("Running on built-in wine knowledge — add OPENAI_API_KEY for live retail + quality data.");
+      warnings.push("Running on built-in wine knowledge — add OPENROUTER_API_KEY for live retail + quality data.");
     }
 
     // Value lift: cheapest third of priced wines gets a small bump when no retail data.
@@ -65,15 +65,26 @@ export async function POST(req: NextRequest) {
 }
 
 async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedWine[]> {
-  const key = process.env.OPENAI_API_KEY!;
+  const orKey = process.env.OPENROUTER_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+  const useOpenRouter = Boolean(orKey);
+  const model = useOpenRouter
+    ? (process.env.OPENROUTER_MODEL ?? process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha")
+    : (process.env.OPENAI_MODEL ?? "gpt-4o-mini");
   const uncached = wines.filter((w) => !cache.has(cacheKey(w)));
   if (uncached.length) {
     const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(uncached.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    const endpoint = useOpenRouter ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${useOpenRouter ? orKey! : openaiKey!}`,
+      "Content-Type": "application/json",
+      ...(useOpenRouter ? { "HTTP-Referer": "https://instant-paire.vercel.app", "X-Title": "Instant Paire" } : {}),
+    };
+    const res = await fetch(endpoint, {
       method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
-        model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+        model,
         temperature: 0.2,
         response_format: { type: "json_object" },
         messages: [

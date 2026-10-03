@@ -4,7 +4,7 @@ import type { WineCandidate } from "@/lib/types";
 export const runtime = "nodejs";
 export const maxDuration = 45;
 
-const DEFAULT_MODEL = process.env.OPENROUTER_OCR_MODEL ?? "google/gemini-2.5-flash";
+const DEFAULT_MODEL = process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha";
 const MAX_CHARS = 4_500_000; // ~3.3MB base64
 
 type OcrWine = {
