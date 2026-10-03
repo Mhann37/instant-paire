@@ -123,6 +123,7 @@ export function RankCard({
           <p className={`mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[12.5px] ${hero ? "text-[#e9cbd5]" : "text-mute"}`}>
             <CategoryDot category={wine.category} />
             <span>{CATEGORY_LABEL[wine.category]}{wine.style && wine.style !== wine.category && wine.style !== "wine" ? ` · ${wine.style}` : ""}</span>
+            {wine.region ? <span>· {wine.region}</span> : null}
             <span>· {wine.listPrice ? `${sym}${wine.listPrice} on list` : "Price not read"}</span>
             {wine.typicalRetailGBP ? <span>· ~£{wine.typicalRetailGBP} retail</span> : null}
           </p>

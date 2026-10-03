@@ -84,7 +84,7 @@ async function judgeChunk(subset: EnrichedWine[], dish: string, apiKey: string, 
   const sym = CURRENCIES[currency].symbol;
   const questions: Record<string, unknown> = {};
   for (const w of subset) {
-    const label = `${w.rawName}${w.vintage ? ` ${w.vintage}` : ""}${w.listPrice ? ` - ${sym}${w.listPrice}` : ""} (${w.style})`;
+    const label = `${w.rawName}${w.region ? `, ${w.region}` : ""}${w.vintage ? ` ${w.vintage}` : ""}${w.listPrice ? ` - ${sym}${w.listPrice}` : ""} (${w.style})`;
     questions[`pair_${w.id}`] = {
       type: "score",
       instructions: `How well does this wine suit the dish "${dish}"? Wine: ${label}.`,

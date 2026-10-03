@@ -5,6 +5,8 @@ export type WineCandidate = {
   rawName: string;
   vintage?: string;
   listPrice?: number;
+  region?: string; // as printed on the menu, e.g. "Barossa Valley"
+  section?: string; // nearest grape/style heading, e.g. "Red - Shiraz"
   ocrConfidence: number; // 0-1
   needsReview: boolean;
 };

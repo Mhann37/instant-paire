@@ -55,7 +55,7 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
     const affinity = sanitiseAffinity(body.taste);
 
     const seenIds = new Set<string>();
-    const wines: WineCandidate[] = (Array.isArray(body.wines) ? body.wines.slice(0, 40) : []).flatMap((raw, i) => {
+    const wines: WineCandidate[] = (Array.isArray(body.wines) ? body.wines.slice(0, 60) : []).flatMap((raw, i) => {
       const w = (raw ?? {}) as Record<string, unknown>;
       const rawName = typeof w.rawName === "string" ? w.rawName.trim().slice(0, 120) : "";
       if (!rawName) return [];
@@ -70,6 +70,8 @@ async function handle(req: NextRequest, deviceId: string): Promise<NextResponse>
         rawName,
         vintage: typeof w.vintage === "string" && /^(19|20)\d{2}$/.test(w.vintage) ? w.vintage : undefined,
         listPrice: Number.isFinite(price) && price > 0 ? price : undefined,
+        region: typeof w.region === "string" && w.region.trim() ? w.region.trim().slice(0, 60) : undefined,
+        section: typeof w.section === "string" && w.section.trim() ? w.section.trim().slice(0, 60) : undefined,
         ocrConfidence: Number.isFinite(ocr) ? Math.max(0, Math.min(1, ocr)) : 0.7,
         needsReview: w.needsReview === true,
       }];
@@ -245,7 +247,7 @@ async function llmEnrich(dish: string, wines: EnrichedWine[], diagnostics: strin
     for (let i = 0; i < uncached.length; i += ENRICH_CHUNK) chunks.push(uncached.slice(i, i + ENRICH_CHUNK));
 
     const runChunk = async (chunk: EnrichedWine[]) => {
-      const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(chunk.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
+      const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nIdentify each wine from its name, region and menu section (the grape heading it sat under). Infer the grape/style when the producer and region make it clear.\nWines: ${JSON.stringify(chunk.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, region: w.region, menuSection: w.section, listPrice: w.listPrice })))}`;
       const models = orKey ? [ENRICH_MODEL, ENRICH_FALLBACK_MODEL].filter((m, i, a) => m && a.indexOf(m) === i) : ["openai"];
       let lastErr: unknown;
       for (const model of models) {

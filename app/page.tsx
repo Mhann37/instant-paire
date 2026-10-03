@@ -10,13 +10,13 @@ import { CategoryDot, MiniRow, RankCard } from "@/components/Results";
 
 type Phase = "input" | "working" | "results";
 type Stage = "reading" | "pairing";
-type OcrResult = { wines: WineCandidate[]; currency: CurrencyCode; info: string };
+type OcrResult = { wines: WineCandidate[]; currency: CurrencyCode; info: string; partial: boolean };
 
 // Serverless platforms return HTML error pages for oversized payloads, timeouts and
 // crashes. Never call res.json() blindly - read text, then parse, so the user sees
 // a real message instead of "Unexpected token 'A'".
 type ApiError = { error?: string };
-type OcrOk = { wines?: WineCandidate[]; currency?: string; model?: string; ms?: number };
+type OcrOk = { wines?: WineCandidate[]; currency?: string; model?: string; ms?: number; partial?: boolean };
 
 async function postJson<T extends object>(url: string, payload: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -61,27 +61,21 @@ function urlTail(): string {
 }
 
 
-function compressImage(file: File, maxDim = 1280, quality = 0.72): Promise<string> {
+// Text legibility is what drives OCR accuracy, so we cap the WIDTH (not the longest side). A tall phone
+// screenshot (e.g. 1344x2992) is then sliced into overlapping tiles instead of being squashed to ~575px wide.
+const TILE_W = 1280;
+const TILE_H = 1800;
+const TILE_OVERLAP = 120;
+const MAX_TILES = 6;
+const MAX_TOTAL_CHARS = 3_900_000; // server accepts ~4.1M; Vercel's body limit is ~4.5MB
+
+function loadImage(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
-      try {
-        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-        const w = Math.round(img.width * scale);
-        const h = Math.round(img.height * scale);
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("canvas");
-        ctx.drawImage(img, 0, 0, w, h);
-        URL.revokeObjectURL(url);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      } catch (err) {
-        URL.revokeObjectURL(url);
-        reject(err);
-      }
+      URL.revokeObjectURL(url);
+      resolve(img);
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -89,6 +83,44 @@ function compressImage(file: File, maxDim = 1280, quality = 0.72): Promise<strin
     };
     img.src = url;
   });
+}
+
+function drawJpeg(img: HTMLImageElement, sx: number, sy: number, sw: number, sh: number, w: number, h: number, quality: number): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(w));
+  canvas.height = Math.max(1, Math.round(h));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvas");
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+async function prepareImage(file: File): Promise<{ preview: string; tiles: string[] }> {
+  const img = await loadImage(file);
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+  const maxScaledH = MAX_TILES * TILE_H - (MAX_TILES - 1) * TILE_OVERLAP;
+  const preview = drawJpeg(img, 0, 0, W, H, (W * 480) / Math.max(W, H), (H * 480) / Math.max(W, H), 0.6);
+
+  for (const [shrink, quality] of [[1, 0.72], [1, 0.6], [0.8, 0.6], [0.65, 0.55]] as const) {
+    const scale = Math.min(1, TILE_W / W, maxScaledH / H) * shrink;
+    const sw = W * scale;
+    const sh = H * scale;
+    const tiles: string[] = [];
+    if (sh <= TILE_H * 1.25) {
+      tiles.push(drawJpeg(img, 0, 0, W, H, sw, sh, quality));
+    } else {
+      const n = Math.ceil((sh - TILE_OVERLAP) / (TILE_H - TILE_OVERLAP));
+      const tileH = Math.ceil((sh + (n - 1) * TILE_OVERLAP) / n);
+      const step = tileH - TILE_OVERLAP;
+      for (let i = 0; i < n; i++) {
+        const y0 = Math.min(i * step, sh - tileH);
+        tiles.push(drawJpeg(img, 0, y0 / scale, W, tileH / scale, sw, tileH, quality));
+      }
+    }
+    if (tiles.reduce((t, x) => t + x.length, 0) <= MAX_TOTAL_CHARS) return { preview, tiles };
+  }
+  throw new Error("Photo too large to process - try a closer shot of just the wine list.");
 }
 
 const prefersReducedMotion = () => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -119,6 +151,7 @@ export default function Home() {
   // The OCR call starts the moment a photo is chosen (while the user is still typing their dish).
   const ocr = useRef<{ promise: Promise<OcrResult> | null; status: "idle" | "reading" | "ready" | "failed" }>({ promise: null, status: "idle" });
   const ocrInfo = useRef("");
+  const [ocrPartial, setOcrPartial] = useState(false);
   const photoId = useRef(0);
   const runId = useRef(0);
 
@@ -163,19 +196,20 @@ export default function Home() {
     runId.current++; // cancel any in-flight run for the previous photo
     setError(null);
     setWines([]);
+    setOcrPartial(false);
     setManual(false);
     setPhase((p) => (p === "working" ? "input" : p));
     track("scan_started", { has_dish: Boolean(dish.trim()) });
     const t0 = performance.now();
 
     const promise = (async (): Promise<OcrResult> => {
-      const compressed = await compressImage(f);
-      if (id === photoId.current) setImageUrl(compressed);
-      const data = await postJson<OcrOk>("/api/ocr", { image: compressed });
+      const { preview, tiles } = await prepareImage(f);
+      if (id === photoId.current) setImageUrl(preview);
+      const data = await postJson<OcrOk>("/api/ocr", { images: tiles });
       const parsed = data.wines ?? [];
       if (!parsed.length) throw new Error("Couldn't read any wines - try a straighter, well-lit photo, or type them in.");
       track("ocr_completed", { wine_count: parsed.length, model: data.model ?? "openrouter", ms: Math.round(performance.now() - t0) });
-      return { wines: parsed, currency: parseCurrency(data.currency), info: `ocr ${data.model ?? "?"} server ${data.ms ?? "?"}ms, total ${Math.round(performance.now() - t0)}ms` };
+      return { wines: parsed, currency: parseCurrency(data.currency), partial: Boolean(data.partial), info: `ocr ${tiles.length} slice(s) ${data.model ?? "?"} server ${data.ms ?? "?"}ms, total ${Math.round(performance.now() - t0)}ms` };
     })();
     ocr.current = { promise, status: "reading" };
     promise.then(
@@ -185,6 +219,7 @@ export default function Home() {
         setWines(r.wines);
         setCurrency(r.currency);
         ocrInfo.current = r.info;
+        setOcrPartial(r.partial);
       },
       (e) => {
         if (id !== photoId.current) return;
@@ -506,6 +541,9 @@ export default function Home() {
           <section className="mt-6">
             <div ref={resultsRef} tabIndex={-1} className="scroll-mt-4 outline-none">
               <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.14em] text-mute">Your pairings</h2>
+              {ocrPartial && (
+                <p className="mb-2 rounded-2xl border border-line bg-white px-4 py-2 text-xs text-mute">Part of the list couldn&apos;t be read - check “wines read” below and add anything missing.</p>
+              )}
               {meta?.warnings?.map((w) => (
                 <p key={w} className="mb-2 rounded-2xl border border-line bg-white px-4 py-2 text-xs text-mute">{w}</p>
               ))}

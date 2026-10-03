@@ -3,8 +3,8 @@ import type { EnrichedWine, WineCandidate } from "./types";
 // Heuristic enrichment so v1 works with zero API keys.
 // If OPENAI_API_KEY is set, /api/rank upgrades these via a single batched LLM call.
 
-const RED = ["pinot noir", "bordeaux", "cabernet", "merlot", "malbec", "shiraz", "syrah", "rioja", "barolo", "chianti", "tempranillo", "grenache", "nebbiolo", "zinfandel", "beaujolais"];
-const WHITE = ["chardonnay", "sauvignon", "chablis", "sancerre", "riesling", "pinot grigio", "pinot gris", "albariño", "albarino", "viognier", "chenin", "gavi", "vermentino"];
+const RED = ["pinot noir", "bordeaux", "cabernet", "merlot", "malbec", "shiraz", "syrah", "rioja", "barolo", "chianti", "tempranillo", "grenache", "nebbiolo", "zinfandel", "beaujolais", "gsm", "pinotage", "sangiovese", "primitivo", "mourvedre", "touriga"];
+const WHITE = ["chardonnay", "sauvignon", "chablis", "sancerre", "riesling", "pinot grigio", "pinot gris", "albariño", "albarino", "viognier", "chenin", "gavi", "vermentino", "semillon", "sémillon", "verdelho", "fiano", "grüner", "gruner", "pinot blanc", "marsanne", "roussanne", "muscadet"];
 const SPARK = ["champagne", "prosecco", "cava", "crémant", "cremant", "pét-nat", "pet-nat", "english sparkling"];
 const ROSE = ["rosé", "rose", "provence"];
 
