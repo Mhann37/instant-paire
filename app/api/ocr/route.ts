@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
     return fail("Photo reading isn't configured yet. Add OPENROUTER_API_KEY in Vercel, or add wines manually below.", 501);
   }
 
-  let body: { image?: unknown; model?: unknown };
+  let body: { image?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
   if (!image.startsWith("data:image/")) return fail("Send the photo as an image data URL.", 400);
   if (image.length > MAX_CHARS) return fail("Photo too large - take a closer shot of just the wine list.", 413);
 
-  const model = typeof body.model === "string" && body.model ? body.model : DEFAULT_MODEL;
+  const model = DEFAULT_MODEL;
 
   try {
     const controller = new AbortController();
