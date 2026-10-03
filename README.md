@@ -18,7 +18,9 @@ Open http://localhost:3000.
 Copy `.env.example` to `.env.local`:
 
 - `OPENROUTER_API_KEY` — **required**. Powers photo OCR, wine enrichment, and live Jev decisioning. Models:
-  - `OPENROUTER_OCR_MODEL` (default `stealth/space-bunny-alpha`) — vision list extraction
+  - `OCR_MODEL` (default `inclusionai/ling-3.0-flash-vl`) — vision list extraction, run with reasoning off and a token cap for speed
+  - `OCR_FALLBACK_MODEL` (default `google/gemini-3.8-flash`) — one retry if the primary errors or finds no wines
+  - (the old `OPENROUTER_OCR_MODEL` variable is no longer read - delete it from Vercel if set)
   - `OPENROUTER_MODEL` (default `stealth/space-bunny-alpha`) — enrichment
   - `JEV_MODEL` (default `typesafe/jev-1.13`) — System One pairing/value judgments via `POST https://openrouter.ai/api/alpha/decisions`
 - `NEXT_PUBLIC_GA4_ID` — GA4 measurement ID. Empty = analytics disabled.
@@ -27,7 +29,7 @@ Copy `.env.example` to `.env.local`:
 
 ## How it works
 
-1. Photo is compressed on-device (max 1600px JPEG), then read by a vision model via OpenRouter (`POST /api/ocr` -> structured `{name, vintage, listPrice, confidence}` JSON).
+1. Photo is compressed on-device (max 1280px JPEG). OCR starts the moment it is chosen - while the user types their dish - via `POST /api/ocr` (compact `name|vintage|price` lines, bottle price preferred over glass, currency detected). With a dish already typed it flows straight into ranking and scrolls to the results; there is no manual review step (wines can be edited afterwards under the results).
 2. `POST /api/rank` enriches (heuristic now, batched LLM when key set, cached), then calls Jev `typesafe/jev-1.13` via the OpenRouter Decisions API — one request, parallel `pair_*` Score + `value_*` Noul questions per wine — and blends Jev answers with data-quality reality (OCR, groundedness) into confidence bands High/Medium/Low. Falls back to built-in scoring if Jev is unreachable.
 3. UI shows Best Match / Best Value / Wildcard + full ranked list. Low-OCR or unconfirmed entries are capped and flagged, never hidden.
 

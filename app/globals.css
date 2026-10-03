@@ -1,13 +1,51 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #faf6f0;
+  --foreground: #2a1a1f;
+  --mute: #7a6a6e;
+  --line: #eadfd3;
+  --claret: #7a1f3d;
+  --claret-deep: #4e1128;
+  --gold: #b8862b;
+  --gold-soft: #f0d48a;
+  --green: #1f7a5a;
+  --violet: #6b4fa0;
+}
+
+@theme inline {
+  --color-claret: var(--claret);
+  --color-claret-deep: var(--claret-deep);
+  --color-cream: var(--background);
+  --color-ink: var(--foreground);
+  --color-mute: var(--mute);
+  --color-line: var(--line);
+  --color-gold: var(--gold);
+  --color-wgreen: var(--green);
+  --color-violet: var(--violet);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: ui-sans-system, -apple-system, "Segoe UI", Inter, sans-serif;
+  font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Results reveal: cards rise in one after another (--i = index). */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(18px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.rise { animation: rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both; animation-delay: calc(var(--i, 0) * 90ms); }
+
+@keyframes sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+.sweep { animation: sweep 1.4s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .sweep { animation: none; }
+  html { scroll-behavior: auto; }
 }

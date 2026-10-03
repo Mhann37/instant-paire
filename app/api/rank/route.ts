@@ -13,6 +13,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const ENRICH_TTL_SEC = 60 * 60 * 24 * 30;
+const ENRICH_CHUNK = 20;
 const CATEGORIES = ["red", "white", "rose", "sparkling", "dessert"] as const;
 
 function fail(error: string, status: number) {
@@ -184,7 +185,7 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
   const openaiKey = process.env.OPENAI_API_KEY;
   const useOpenRouter = Boolean(orKey);
   const model = useOpenRouter
-    ? (process.env.OPENROUTER_MODEL ?? process.env.OPENROUTER_OCR_MODEL ?? "stealth/space-bunny-alpha")
+    ? (process.env.OPENROUTER_MODEL ?? "stealth/space-bunny-alpha")
     : (process.env.OPENAI_MODEL ?? "gpt-4o-mini");
 
   // Shared cache (Redis when configured), keyed on the wine itself - ids are per-scan.
@@ -199,46 +200,62 @@ async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedW
   const uncached = wines.filter((_, i) => !byKey.has(keys[i]));
   if (uncached.length) {
     const idToKey = new Map(wines.map((w, i) => [w.id, keys[i]]));
-    const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(uncached.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
     const endpoint = useOpenRouter ? "https://openrouter.ai/api/v1/chat/completions" : "https://api.openai.com/v1/chat/completions";
     const headers: Record<string, string> = {
       Authorization: `Bearer ${useOpenRouter ? orKey! : openaiKey!}`,
       "Content-Type": "application/json",
       ...(useOpenRouter ? { "HTTP-Referer": "https://instant-paire.vercel.app", "X-Title": "Instant Paire" } : {}),
     };
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      signal: AbortSignal.timeout(25_000),
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: "Return only JSON: {wines: [...]}. Never invent vintages. Use null when unsure." },
-          { role: "user", content: prompt },
-        ],
-      }),
-    });
-    if (!res.ok) throw new Error(`LLM ${res.status}`);
-    const data = await res.json();
-    const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? "{}") as { wines?: LlmWineItem[] };
-    const arr: LlmWineItem[] = parsed.wines ?? [];
+
+    // Two parallel halves instead of one big call: roughly halves the wall-clock time on long lists.
+    const chunks: EnrichedWine[][] = [];
+    for (let i = 0; i < uncached.length; i += ENRICH_CHUNK) chunks.push(uncached.slice(i, i + ENRICH_CHUNK));
+
+    const runChunk = async (chunk: EnrichedWine[]) => {
+      const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(chunk.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        signal: AbortSignal.timeout(25_000),
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          max_tokens: 3000,
+          response_format: { type: "json_object" },
+          // Lookup, not deliberation: skip the thinking tokens (OpenRouter only).
+          ...(useOpenRouter ? { reasoning: { enabled: false }, include_reasoning: false } : {}),
+          messages: [
+            { role: "system", content: "Return only JSON: {wines: [...]}. Never invent vintages. Use null when unsure." },
+            { role: "user", content: prompt },
+          ],
+        }),
+      });
+      if (!res.ok) throw new Error(`LLM ${res.status}`);
+      const data = await res.json();
+      const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? "{}") as { wines?: LlmWineItem[] };
+      return parsed.wines ?? [];
+    };
+
+    const settled = await Promise.allSettled(chunks.map(runChunk));
+    if (settled.every((r) => r.status === "rejected")) throw new Error("All enrichment calls failed");
     const fresh: [string, Partial<EnrichedWine>][] = [];
-    for (const item of arr) {
-      if (!item?.id) continue;
-      const key = idToKey.get(item.id);
-      if (!key) continue;
-      const fields: Partial<EnrichedWine> = {
-        style: String(item.style ?? "wine").slice(0, 60),
-        category: validCat(item.category),
-        body: num(item.body, 1), acidity: num(item.acidity, 1), tannin: num(item.tannin, 0),
-        typicalRetailGBP: typeof item.typicalRetailGBP === "number" ? item.typicalRetailGBP : undefined,
-        qualityTier: typeof item.qualityTier === "string" && ["value", "solid", "fine"].includes(item.qualityTier) ? (item.qualityTier as EnrichedWine["qualityTier"]) : "unknown",
-        grounded: true,
-      };
-      byKey.set(key, fields);
-      fresh.push([key, fields]);
+    for (const r of settled) {
+      if (r.status !== "fulfilled") continue;
+      for (const item of r.value) {
+        if (!item?.id) continue;
+        const key = idToKey.get(item.id);
+        if (!key) continue;
+        const fields: Partial<EnrichedWine> = {
+          style: String(item.style ?? "wine").slice(0, 60),
+          category: validCat(item.category),
+          body: num(item.body, 1), acidity: num(item.acidity, 1), tannin: num(item.tannin, 0),
+          typicalRetailGBP: typeof item.typicalRetailGBP === "number" ? item.typicalRetailGBP : undefined,
+          qualityTier: typeof item.qualityTier === "string" && ["value", "solid", "fine"].includes(item.qualityTier) ? (item.qualityTier as EnrichedWine["qualityTier"]) : "unknown",
+          grounded: true,
+        };
+        byKey.set(key, fields);
+        fresh.push([key, fields]);
+      }
     }
     await setJsonMany(fresh, ENRICH_TTL_SEC);
   }
