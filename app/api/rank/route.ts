@@ -1,0 +1,124 @@
+import { NextRequest, NextResponse } from "next/server";
+import type { EnrichedWine, RankResponse, RankedWine, WineCandidate } from "@/lib/types";
+import { heuristicEnrich } from "@/lib/enrich";
+import { judgeWine } from "@/lib/jev";
+
+export const runtime = "nodejs";
+export const maxDuration = 30;
+
+// In-memory cache for wine enrichment (per-instance; upgrade to Vercel KV later
+// by swapping getCached/setCached with @vercel/kv — same key shape).
+const cache = new Map<string, Partial<EnrichedWine>>();
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const dish: string = String(body.dish ?? "").slice(0, 200);
+    const wines: WineCandidate[] = Array.isArray(body.wines) ? body.wines.slice(0, 40) : [];
+    if (!dish.trim()) return NextResponse.json({ error: "Tell us what you're eating first." }, { status: 400 });
+    if (!wines.length) return NextResponse.json({ error: "No wines to rank — rescan the list." }, { status: 400 });
+
+    let enriched = heuristicEnrich(wines);
+    let enrichment: RankResponse["meta"]["enrichment"] = "heuristic";
+    const warnings: string[] = [];
+
+    // Upgrade with LLM when key present (single batched call).
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        enriched = await llmEnrich(dish, enriched);
+        enrichment = "llm";
+      } catch {
+        warnings.push("Live wine lookup failed — used on-device estimates instead.");
+      }
+    } else {
+      warnings.push("Running on built-in wine knowledge — add OPENAI_API_KEY for live retail + quality data.");
+    }
+
+    // Value lift: cheapest third of priced wines gets a small bump when no retail data.
+    const priced = enriched.filter((w) => w.listPrice).sort((a, b) => (a.listPrice ?? 0) - (b.listPrice ?? 0));
+    const cheapSet = new Set(priced.slice(0, Math.ceil(priced.length / 3)).map((w) => w.id));
+
+    const ranked: RankedWine[] = enriched.map((w) => {
+      const j = judgeWine(w, dish);
+      let valueScore = j.valueScore;
+      if (!w.grounded && cheapSet.has(w.id) && w.listPrice) valueScore = Math.min(0.9, valueScore + 0.12);
+      const finalScore = Math.round((j.pairingFit / 2) * 50 + valueScore * 30 + (j.qualityScore / 2) * 20);
+      // Cap confidence-displayed picks when OCR shaky or ungrounded
+      const cappedFinal = w.ocrConfidence < 0.6 || !w.listPrice ? Math.min(finalScore, 69) : finalScore;
+      const band = j.confidence >= 0.8 ? "High" : j.confidence >= 0.62 ? "Medium" : "Low";
+      return { ...w, pairingFit: j.pairingFit, valueScore, qualityScore: j.qualityScore, finalScore: cappedFinal, confidence: j.confidence, confidenceBand: band, why: j.why, flags: j.flags };
+    });
+
+    ranked.sort((a, b) => b.finalScore - a.finalScore);
+
+    // Assign roles: best overall, best value (cheaper + value>=0.6), wildcard (different category, pairing>=1.3)
+    if (ranked[0]) ranked[0].role = "Best Match";
+    const valuePick = ranked.find((w) => w.role !== "Best Match" && (w.listPrice ?? Infinity) <= (ranked[0]?.listPrice ?? Infinity) && w.valueScore >= 0.6);
+    if (valuePick) valuePick.role = "Best Value";
+    const wild = ranked.find((w) => !w.role && w.category !== ranked[0]?.category && w.pairingFit >= 1.2 && w.confidence >= 0.55);
+    if (wild) wild.role = "Wildcard";
+
+    return NextResponse.json({ ranked, dish, meta: { enrichment, decisioning: process.env.TYPESAFE_API_KEY ? "jev" : "heuristic", warnings } } satisfies RankResponse);
+  } catch {
+    return NextResponse.json({ error: "Ranking failed — try again." }, { status: 500 });
+  }
+}
+
+async function llmEnrich(dish: string, wines: EnrichedWine[]): Promise<EnrichedWine[]> {
+  const key = process.env.OPENAI_API_KEY!;
+  const uncached = wines.filter((w) => !cache.has(cacheKey(w)));
+  if (uncached.length) {
+    const prompt = `You are a sommelier data API. For each wine below, return JSON array with: {id, style (short), category (red|white|rose|sparkling|dessert|unknown), body (0-2), acidity (0-2), tannin (0-2), typicalRetailGBP (number or null, UK high-street price), qualityTier (value|solid|fine|unknown)}.\nWines: ${JSON.stringify(uncached.map((w) => ({ id: w.id, name: w.rawName, vintage: w.vintage, listPrice: w.listPrice })))}`;
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: "Return only JSON: {wines: [...]}. Never invent vintages. Use null when unsure." },
+          { role: "user", content: prompt },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`LLM ${res.status}`);
+    const data = await res.json();
+    const parsed = JSON.parse(data.choices?.[0]?.message?.content ?? "{}") as { wines?: LlmWineItem[] };
+    const arr: LlmWineItem[] = parsed.wines ?? [];
+    for (const item of arr) {
+      if (!item?.id) continue;
+      cache.set(cacheKey({ rawName: "", id: item.id } as EnrichedWine, item.id), {
+        style: String(item.style ?? "wine").slice(0, 60),
+        category: validCat(item.category),
+        body: num(item.body, 1), acidity: num(item.acidity, 1), tannin: num(item.tannin, 0),
+        typicalRetailGBP: typeof item.typicalRetailGBP === "number" ? item.typicalRetailGBP : undefined,
+        qualityTier: typeof item.qualityTier === "string" && ["value", "solid", "fine"].includes(item.qualityTier) ? (item.qualityTier as EnrichedWine["qualityTier"]) : "unknown",
+        grounded: true,
+      });
+    }
+  }
+  return wines.map((w) => ({ ...w, ...(cache.get(cacheKey(w)) ?? {}) }));
+}
+
+function cacheKey(w: EnrichedWine, overrideId?: string) {
+  return `wine:${(overrideId ?? w.id)}`;
+}
+
+type LlmWineItem = {
+  id: string;
+  style?: unknown;
+  category?: unknown;
+  body?: unknown;
+  acidity?: unknown;
+  tannin?: unknown;
+  typicalRetailGBP?: unknown;
+  qualityTier?: unknown;
+};
+function validCat(c: unknown): EnrichedWine["category"] {
+  return ["red", "white", "rose", "sparkling", "dessert"].includes(c as string) ? (c as EnrichedWine["category"]) : "unknown";
+}
+function num(v: unknown, fb: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : fb;
+}
